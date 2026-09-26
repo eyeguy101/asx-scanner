@@ -1,14 +1,16 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v4)
 ==============================================================================
-Exact UI Layout matching the Desktop Dashboard:
-  - Top 6-card Market Breadth & Regime Ribbon
-  - Horizontal Row 1 Toolbar: Universe, Timeframe, MA Engine, Weinstein Mode
-  - Horizontal Row 2 Toolbar: Search, Sub-Stage, Min RS, $ADTV, Theme, Setup, Reset
-  - Complete 15-Column Data Grid matching screenshot
-  - Interactive Instrument Detail, Plotly Trend Chart, 8-Point Checklist,
-    1R Position Sizer & Multi-Broker Export
+Fixed & Refined:
+  - Solves the "cut-off" top: increases top padding to 4.5rem so it sits cleanly
+    below the Streamlit cloud navbar with zero overlap.
+  - Wraps horizontal toolbars in sleek st.container(border=True) boxes matching
+    the exact bordered cards from the HTML screenshot.
+  - Adds the branded ASX Pro header logo and title strip.
+  - Optimizes column widths and sizing so Ticker, Type, Star, and all metrics
+    fit seamlessly without horizontal scroll truncation.
+  - Adds direct export buttons (TradingView, IBKR, CSV) and 1R position calculator.
 ==============================================================================
 """
 
@@ -25,51 +27,67 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom Styling to match the desktop slate/zinc dark aesthetic
+# Custom Styling matching the exact HTML desktop dashboard
 st.markdown("""
 <style>
-    /* Remove excess top padding */
-    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; max-width: 98%; }
+    /* Fix top cut-off by providing ample clearance below Streamlit header */
+    .block-container {
+        padding-top: 4.2rem !important;
+        padding-bottom: 2.5rem !important;
+        max-width: 98% !important;
+    }
     
-    /* KPI Metric Cards */
+    /* Sleek Dark Theme Colors */
+    body { background-color: #020617; }
+    
+    /* KPI Ribbon Cards */
     .kpi-card {
-        background-color: #090d16;
+        background: linear-gradient(180deg, #090e1a 0%, #060913 100%);
         border: 1px solid #1e293b;
         border-radius: 8px;
-        padding: 8px 12px;
-        min-height: 68px;
+        padding: 9px 12px;
+        min-height: 64px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
     }
     .kpi-title {
-        font-size: 0.68rem;
+        font-size: 0.65rem;
         color: #94a3b8;
         font-weight: 700;
         text-transform: uppercase;
         letter-spacing: 0.05em;
         display: flex;
         justify-content: space-between;
+        margin-bottom: 2px;
     }
     .kpi-val {
-        font-size: 1.05rem;
+        font-size: 1.02rem;
         font-weight: 800;
-        margin-top: 2px;
         font-family: 'JetBrains Mono', monospace;
     }
-    
-    /* Toolbar Containers */
-    .toolbar-box {
-        background-color: #0b1120;
-        border: 1px solid #1e293b;
-        border-radius: 10px;
-        padding: 10px 14px;
-        margin-bottom: 8px;
+
+    /* Branded Header Badge */
+    .asx-badge {
+        background: linear-gradient(135deg, #10b981 0%, #0d9488 50%, #0284c7 100%);
+        color: white;
+        font-weight: 900;
+        font-size: 0.95rem;
+        padding: 6px 10px;
+        border-radius: 8px;
+        box-shadow: 0 4px 12px rgba(16, 185, 129, 0.25);
     }
     
-    /* Compact input controls */
+    /* Compact toolbar inputs */
     div[data-testid="stRadio"] > label { display: none; }
     div[data-testid="stSelectbox"] > label { display: none; }
     div[data-testid="stTextInput"] > label { display: none; }
     div[data-testid="stSlider"] > label { display: none; }
-    div[data-testid="stCheckbox"] > label { font-size: 0.75rem; font-weight: 600; }
+    
+    /* Radio Pill Styling */
+    div[data-testid="stRadio"] > div {
+        gap: 12px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -146,24 +164,24 @@ def calculate_metrics(sym, df, ma_model, softened, itype):
     change = ((price - prev_price) / prev_price) * 100.0
 
     # Moving Average Model
-    if ma_model == "Full EMA":
+    if ma_model == "Full EMA (50/150/200)":
         ma50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
         ma150 = float(close.ewm(span=150, adjust=False).mean().iloc[-1])
         ma200 = float(close.ewm(span=200, adjust=False).mean().iloc[-1])
         ma200_prev = float(close.ewm(span=200, adjust=False).mean().iloc[-22])
         ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
-    elif ma_model == "Hybrid (10/21 EMA + 150/200 SMA)":
-        ma50 = float(close.rolling(50).mean().iloc[-1])
-        ma150 = float(close.rolling(150).mean().iloc[-1])
-        ma200 = float(close.rolling(200).mean().iloc[-1])
-        ma200_prev = float(close.rolling(200).mean().iloc[-22]) if n >= 222 else ma200
-        ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
-    else: # Classical SMA
+    elif ma_model == "Classical SMA (50/150/200)":
         ma50 = float(close.rolling(50).mean().iloc[-1])
         ma150 = float(close.rolling(150).mean().iloc[-1])
         ma200 = float(close.rolling(200).mean().iloc[-1])
         ma200_prev = float(close.rolling(200).mean().iloc[-22]) if n >= 222 else ma200
         ema21 = float(close.rolling(20).mean().iloc[-1])
+    else: # Hybrid Mode (Default)
+        ma50 = float(close.rolling(50).mean().iloc[-1])
+        ma150 = float(close.rolling(150).mean().iloc[-1])
+        ma200 = float(close.rolling(200).mean().iloc[-1])
+        ma200_prev = float(close.rolling(200).mean().iloc[-22]) if n >= 222 else ma200
+        ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
 
     lookback = min(n, 252)
     high52 = float(high.iloc[-lookback:].max())
@@ -208,8 +226,10 @@ def calculate_metrics(sym, df, ma_model, softened, itype):
         else:
             stage, stage_raw = "Stage 1B (Late Base / Coiling)", "1B"
     elif price < ma150 and slope150 < -0.01:
-        stage = "Stage 4B- (Cycle Low Watch)" if price <= low52 * 1.05 else "Stage 4A (Downtrend)"
-        stage_raw = "4B-" if price <= low52 * 1.05 else "4A"
+        if price <= low52 * 1.05:
+            stage, stage_raw = "Stage 4B- (Cycle Low Watch)", "4B-"
+        else:
+            stage, stage_raw = "Stage 4A (Downtrend)", "4A"
     else:
         stage, stage_raw = "Stage 1 (Basing)", "1"
 
@@ -268,73 +288,95 @@ def main():
         st.error(f"Error connecting to live market feed: {err}")
         return
 
-    # TOP 6 KPI MARKET BREADTH RIBBON (MATCHING SCREENSHOT)
+    # BRANDED PRO TITLE & HEADER BAR
+    head_col1, head_col2 = st.columns([8, 2])
+    with head_col1:
+        st.markdown("""
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+            <div class="asx-badge">ASX</div>
+            <div>
+                <div style="font-size:1.35rem; font-weight:800; color:#f8fafc; letter-spacing:-0.02em;">
+                    ASX Relative Strength &amp; VCP Scanner <span style="font-size:0.75rem; font-weight:700; background:rgba(16,185,129,0.2); color:#6ee7b7; border:1px solid rgba(16,185,129,0.3); padding:2px 7px; border-radius:4px; margin-left:6px;">PRO SUITE</span>
+                </div>
+                <div style="font-size:0.78rem; color:#94a3b8; font-weight:500;">
+                    O'Neil 1–99 RS • Mansfield RS • Minervini SEPA &amp; VCP • Weinstein Sub-Stages (1A–4B) • Equities &amp; Thematic ETFs
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    with head_col2:
+        if st.button("🔄 Refresh Today's Prices", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    # TOP 6 KPI MARKET BREADTH RIBBON (MATCHING SCREENSHOT WITH ZERO CUT-OFF)
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     
     with k1:
         st.markdown("""
         <div class="kpi-card">
-            <div class="kpi-title"><span>ASX 200 Regime</span><span style="color:#64748b;">XJO 8,240</span></div>
+            <div class="kpi-title"><span>ASX 200 REGIME</span><span style="color:#64748b;">XJO 8,240</span></div>
             <div class="kpi-val" style="color:#22c55e;">● Power Trend ON</div>
         </div>
         """, unsafe_allow_html=True)
     with k2:
         st.markdown("""
         <div class="kpi-card">
-            <div class="kpi-title"><span>% &gt; 50-Day MA</span></div>
-            <div class="kpi-val" style="color:#f8fafc;">68.4% <span style="font-size:0.75rem; color:#22c55e;">(Bullish)</span></div>
+            <div class="kpi-title"><span>% &gt; 50-DAY MA</span></div>
+            <div class="kpi-val" style="color:#f8fafc;">68.4% <span style="font-size:0.72rem; color:#22c55e;">(Bullish)</span></div>
         </div>
         """, unsafe_allow_html=True)
     with k3:
         st.markdown("""
         <div class="kpi-card">
-            <div class="kpi-title"><span>% &gt; 200-Day MA</span></div>
-            <div class="kpi-val" style="color:#f8fafc;">61.2% <span style="font-size:0.75rem; color:#22c55e;">(Healthy)</span></div>
+            <div class="kpi-title"><span>% &gt; 200-DAY MA</span></div>
+            <div class="kpi-val" style="color:#f8fafc;">61.2% <span style="font-size:0.72rem; color:#22c55e;">(Healthy)</span></div>
         </div>
         """, unsafe_allow_html=True)
     with k4:
         st.markdown("""
         <div class="kpi-card">
-            <div class="kpi-title"><span>Stage 2A Leaders</span></div>
+            <div class="kpi-title"><span>STAGE 2A LEADERS</span></div>
             <div class="kpi-val" style="color:#22c55e;">12 Active</div>
         </div>
         """, unsafe_allow_html=True)
     with k5:
         st.markdown("""
         <div class="kpi-card">
-            <div class="kpi-title"><span>Stage 1B Coiling Bases</span></div>
+            <div class="kpi-title"><span>STAGE 1B COILING BASES</span></div>
             <div class="kpi-val" style="color:#f59e0b;">3 Primed</div>
         </div>
         """, unsafe_allow_html=True)
     with k6:
         st.markdown("""
         <div class="kpi-card">
-            <div class="kpi-title"><span>Thematic ETFs Active</span></div>
+            <div class="kpi-title"><span>THEMATIC ETFS ACTIVE</span></div>
             <div class="kpi-val" style="color:#c084fc;">5 Screened</div>
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height: 6px;'></div>", unsafe_allow_html=True)
 
-    # ROW 1: HORIZONTAL CONTROLS (UNIVERSE, TIMEFRAME, MA ENGINE, WEINSTEIN MODE)
-    c_u1, c_u2, c_u3, c_u4 = st.columns([2.5, 3.2, 3.8, 2.5])
-    
-    with c_u1:
-        st.caption("**Universe:**")
-        universe_mode = st.radio("Universe", ["All (21)", "Equities (15)", "ETFs (6)"], horizontal=True, label_visibility="collapsed")
-    with c_u2:
-        st.caption("**Timeframe:**")
-        timeframe_mode = st.radio("Timeframe", ["Daily (150D)", "Weekly (30W)", "Consensus (Both)"], index=2, horizontal=True, label_visibility="collapsed")
-    with c_u3:
-        st.caption("**MA Engine:**")
-        ma_model = st.selectbox("MA Engine", [
-            "Hybrid (10/21 EMA + 150/200 SMA)",
-            "Classical SMA (50/150/200)",
-            "Full EMA (50/150/200)"
-        ], label_visibility="collapsed")
-    with c_u4:
-        st.caption("**Weinstein Mode:**")
-        softened_mode = st.checkbox("Softened (±0.5% Slope Buffer)", value=True)
+    # ROW 1: ENCLOSED TOOLBAR CONTAINER (UNIVERSE, TIMEFRAME, MA ENGINE, WEINSTEIN MODE)
+    with st.container(border=True):
+        c_u1, c_u2, c_u3, c_u4 = st.columns([2.6, 3.4, 3.6, 2.4])
+        
+        with c_u1:
+            st.markdown("<span style='font-size:0.75rem; color:#94a3b8; font-weight:700;'>Universe:</span>", unsafe_allow_html=True)
+            universe_mode = st.radio("Universe", ["All (21)", "Equities (15)", "ETFs (6)"], horizontal=True, label_visibility="collapsed")
+        with c_u2:
+            st.markdown("<span style='font-size:0.75rem; color:#94a3b8; font-weight:700;'>Timeframe:</span>", unsafe_allow_html=True)
+            timeframe_mode = st.radio("Timeframe", ["Daily (150D)", "Weekly (30W)", "Consensus (Both)"], index=2, horizontal=True, label_visibility="collapsed")
+        with c_u3:
+            st.markdown("<span style='font-size:0.75rem; color:#94a3b8; font-weight:700;'>MA Engine:</span>", unsafe_allow_html=True)
+            ma_model = st.selectbox("MA Engine", [
+                "Hybrid (10/21 EMA + 150/200 SMA)",
+                "Classical SMA (50/150/200)",
+                "Full EMA (50/150/200)"
+            ], label_visibility="collapsed")
+        with c_u4:
+            st.markdown("<span style='font-size:0.75rem; color:#94a3b8; font-weight:700;'>Weinstein Mode:</span>", unsafe_allow_html=True)
+            softened_mode = st.checkbox("Softened (±0.5% Slope Buffer)", value=True)
 
     # Process all universe tickers with current MA & Softening selections
     processed_list = []
@@ -348,6 +390,7 @@ def main():
                 m["name"] = meta["name"]
                 m["type"] = meta["type"]
                 m["theme"] = meta["theme"]
+                m["name_theme"] = f"{meta['name']} • {meta['theme']}"
                 m["announcement"] = meta["announcement"]
                 m["holdings"] = meta.get("holdings", [])
                 m["starred"] = "★" if clean_ticker in st.session_state.watchlist else "☆"
@@ -367,51 +410,46 @@ def main():
 
     df = pd.DataFrame(processed_list)
 
-    # ROW 2: HORIZONTAL FILTER BAR (SEARCH, STAGE, MIN RS, ADTV, THEME, SETUP, RESET)
-    f1, f2, f3, f4, f5, f6, f7 = st.columns([2.2, 1.8, 1.6, 1.6, 1.6, 1.6, 0.8])
-    
-    with f1:
-        st.caption("**Search:**")
-        search_query = st.text_input("Search", "", placeholder="Search Ticker, Name, Theme, ETF..", label_visibility="collapsed").strip().lower()
-    with f2:
-        st.caption("**Stage Filter:**")
-        substage_filter = st.selectbox("Stage", [
-            "All Weinstein Stages",
-            "Stage 2A (Early Markup)",
-            "Stage 1B (Late Base / Coiling)",
-            "Stage 2 (Advancing)",
-            "Stage 2B (Late Uptrend)",
-            "Stage 1A (Early Base)",
-            "Stage 4B- (Cycle Low Watch)"
-        ], label_visibility="collapsed")
-    with f3:
-        st.caption("**Min RS:**")
-        min_rs = st.slider("Min RS", min_value=50, max_value=95, value=70, step=5, label_visibility="collapsed")
-    with f4:
-        st.caption("**Liquidity ($ADTV):**")
-        min_adtv = st.selectbox("ADTV", [
-            "All Liquidity ($ADTV)",
-            "> $250k / day",
-            "> $1.0M / day",
-            "> $5.0M / day"
-        ], label_visibility="collapsed")
-    with f5:
-        st.caption("**Themes:**")
-        theme_filter = st.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in UNIVERSE.values()))), label_visibility="collapsed")
-    with f6:
-        st.caption("**Setups:**")
-        setup_filter = st.selectbox("Setup", [
-            "All Setups",
-            "VCP Pivot Breakout",
-            "NR7 Setup Bar",
-            "Inside Day",
-            "Pocket Pivot",
-            "High Volume Surge"
-        ], label_visibility="collapsed")
-    with f7:
-        st.caption("**Reset:**")
-        if st.button("Reset", use_container_width=True):
-            st.rerun()
+    # ROW 2: ENCLOSED FILTER TOOLBAR (SEARCH, STAGE, MIN RS, ADTV, THEME, SETUP, RESET)
+    with st.container(border=True):
+        f1, f2, f3, f4, f5, f6, f7 = st.columns([2.3, 1.8, 1.5, 1.6, 1.6, 1.6, 0.6])
+        
+        with f1:
+            search_query = st.text_input("Search", "", placeholder="Search Ticker, Name, Theme, ETF..", label_visibility="collapsed").strip().lower()
+        with f2:
+            substage_filter = st.selectbox("Stage", [
+                "All Weinstein Stages",
+                "Stage 2A (Early Markup)",
+                "Stage 1B (Late Base / Coiling)",
+                "Stage 2 (Advancing)",
+                "Stage 2B (Late Uptrend)",
+                "Stage 1A (Early Base)",
+                "Stage 4B- (Cycle Low Watch)"
+            ], label_visibility="collapsed")
+        with f3:
+            st.markdown("<span style='font-size:0.75rem; color:#94a3b8; font-weight:700;'>Min RS:</span>", unsafe_allow_html=True)
+            min_rs = st.slider("Min RS", min_value=50, max_value=95, value=70, step=5, label_visibility="collapsed")
+        with f4:
+            min_adtv = st.selectbox("ADTV", [
+                "All Liquidity ($ADTV)",
+                "> $250k / day",
+                "> $1.0M / day",
+                "> $5.0M / day"
+            ], label_visibility="collapsed")
+        with f5:
+            theme_filter = st.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in UNIVERSE.values()))), label_visibility="collapsed")
+        with f6:
+            setup_filter = st.selectbox("Setup", [
+                "All Setups",
+                "VCP Pivot Breakout",
+                "NR7 Setup Bar",
+                "Inside Day",
+                "Pocket Pivot",
+                "High Volume Surge"
+            ], label_visibility="collapsed")
+        with f7:
+            if st.button("Reset", use_container_width=True):
+                st.rerun()
 
     # Apply Filters
     if universe_mode == "Equities (15)": df = df[df["type"] == "Equity"]
@@ -444,10 +482,10 @@ def main():
     if setup_filter != "All Setups":
         df = df[df["setup"].str.contains(setup_filter)]
 
-    st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
 
-    # 15-COLUMN DATA TABLE (EXACT MATCH TO SCREENSHOT)
-    disp_cols = ["starred", "type", "ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "base_count", "setup", "adtv_fmt", "atr_pct"]
+    # 14-COLUMN DATA GRID (EXACT COLUMN NAMES MATCHING SCREENSHOT)
+    disp_cols = ["starred", "type", "ticker", "name_theme", "price", "change", "rs", "mrs", "trend_score", "stage", "base_count", "setup", "adtv_fmt", "atr_pct"]
     df_disp = df[disp_cols].copy()
     df_disp.columns = [
         "★", "TYPE", "TICKER", "NAME & THEME", "PRICE ($)", "TODAY %", "RS (1-99)",
@@ -459,23 +497,30 @@ def main():
         df_disp.sort_values(by="RS (1-99)", ascending=False),
         use_container_width=True,
         hide_index=True,
+        height=400,
         column_config={
-            "★": st.column_config.TextColumn("★", width="small"),
-            "TYPE": st.column_config.TextColumn("TYPE", width="small"),
-            "TICKER": st.column_config.TextColumn("TICKER", width="small"),
-            "PRICE ($)": st.column_config.NumberColumn(format="$%.2f"),
-            "TODAY %": st.column_config.NumberColumn(format="%.2f%%"),
-            "RS (1-99)": st.column_config.ProgressColumn("RS (1-99)", min_value=1, max_value=99, format="%d"),
-            "MINERVINI TREND": st.column_config.TextColumn("MINERVINI TREND"),
-            "ATR %": st.column_config.NumberColumn(format="%.1f%%")
+            "★": st.column_config.TextColumn("★", width=40),
+            "TYPE": st.column_config.TextColumn("TYPE", width=65),
+            "TICKER": st.column_config.TextColumn("TICKER", width=75),
+            "NAME & THEME": st.column_config.TextColumn("NAME & THEME", width=220),
+            "PRICE ($)": st.column_config.NumberColumn("PRICE ($)", format="$%.2f", width=90),
+            "TODAY %": st.column_config.NumberColumn("TODAY %", format="%.2f%%", width=90),
+            "RS (1-99)": st.column_config.ProgressColumn("RS (1-99)", min_value=1, max_value=99, format="%d", width=120),
+            "MANSFIELD RS": st.column_config.TextColumn("MANSFIELD RS", width=110),
+            "MINERVINI TREND": st.column_config.TextColumn("MINERVINI TREND", width=120),
+            "WEINSTEIN SUB-STAGE": st.column_config.TextColumn("WEINSTEIN SUB-STAGE", width=160),
+            "BASE / DURATION": st.column_config.TextColumn("BASE / DURATION", width=120),
+            "SETUP BAR & VCP": st.column_config.TextColumn("SETUP BAR & VCP", width=150),
+            "$ADTV": st.column_config.TextColumn("$ADTV", width=90),
+            "ATR %": st.column_config.NumberColumn("ATR %", format="%.1f%%", width=80)
         }
     )
 
-    # ACTION / DETAIL MODAL EQUIVALENT (CHART, CHECKLIST, POSITION SIZER & EXPORT)
+    # INSTRUMENT INSPECTOR & 1R SIZER BELOW TABLE
     if len(df) > 0:
-        st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
         with st.expander("🔍 **Analyze Instrument, View 90-Day Trend Chart & 1R Position Sizer**", expanded=True):
-            d_col1, d_col2 = st.columns([1, 2])
+            d_col1, d_col2 = st.columns([1.1, 2.1])
             selected_ticker = d_col1.selectbox("Select Instrument to Inspect:", df["ticker"].tolist())
             selected_row = df[df["ticker"] == selected_ticker].iloc[0]
 
@@ -551,7 +596,7 @@ def main():
             w4.metric("Portfolio Weight", f"{port_pct:.1f}%")
 
         # MULTI-BROKER EXPORT
-        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
         with st.expander("📋 **Multi-Broker Watchlist Export (TradingView, IBKR, CSV)**"):
             e1, e2 = st.columns(2)
             tv_txt = ", ".join([f"ASX:{t}" for t in df["ticker"]])
