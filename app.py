@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.1)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -11,7 +11,8 @@ Refactored Engine:
   - Phase 4: Timezone-stripped DatetimeIndex for safe resampling.
   - Phase 4: `auto_adjust` removed to prevent yfinance deprecation errors.
   - Phase 4: `fillna(method='ffill')` patched to `ffill()` to resolve Pandas TypeError.
-  - Omitted: 1R Position Sizing and Risk Module.
+  - Phase 4: Fixed Benchmark Volume NaN crash by isolating subset=["Close"].
+  - Phase 4: Implemented Clickable Interactive Dataframe -> Chart sync.
 ==============================================================================
 """
 
@@ -70,9 +71,14 @@ BENCHMARK_MAP = {
     "S&P/ASX 200 (^AXJO)": {"symbol": "^AXJO", "short": "AXJO", "name": "ASX 200"}
 }
 
+# Initialize Session State Variables
 if "watchlist" not in st.session_state:
     query_wl = st.query_params.get("wl", "")
     st.session_state.watchlist = set(query_wl.split(",")) if query_wl else set(["DRO", "SPR", "DYL", "ATOM"])
+if "active_ticker" not in st.session_state:
+    st.session_state.active_ticker = None
+if "last_df_selection" not in st.session_state:
+    st.session_state.last_df_selection = []
 
 def update_query_watchlist():
     st.query_params["wl"] = ",".join(st.session_state.watchlist)
@@ -92,14 +98,12 @@ def make_sparkline_svg(values, stroke_color="#22c55e", fill_color="rgba(34, 197,
 def load_all_market_data(bench_symbol):
     symbols = list(set(list(UNIVERSE.keys()) + [bench_symbol]))
     try:
-        # auto_adjust removed to prevent yfinance deprecation conflicts
         data = yf.download(symbols, period="2y", interval="1d", progress=False, group_by="ticker")
         return data, None
     except Exception as e:
         return None, str(e)
 
 def calculate_metrics(sym, df, bench_series, itype):
-    # Sanitize datetime index to prevent resampling TypeError
     df.index = pd.to_datetime(df.index).tz_localize(None)
     
     if len(df) < 130: return None
@@ -112,13 +116,11 @@ def calculate_metrics(sym, df, bench_series, itype):
     price = float(close.iloc[-1])
     change = ((price - float(close.iloc[-2])) / float(close.iloc[-2])) * 100.0 if n >= 2 else 0.0
 
-    # Moving Averages
     ma50 = float(close.rolling(50).mean().iloc[-1])
     ma150 = float(close.rolling(150).mean().iloc[-1])
     ma200 = float(close.rolling(200).mean().iloc[-1]) if n >= 200 else price
     ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
     
-    # 30-Week MA (Resampled correctly via scrubbed DatetimeIndex)
     df_weekly = df.resample('W-FRI').last().dropna(subset=["Close"])
     weekly_ma30 = float(df_weekly["Close"].rolling(30).mean().iloc[-1]) if len(df_weekly) >= 30 else ma150
     weekly_slope = (weekly_ma30 - float(df_weekly["Close"].rolling(30).mean().iloc[-4])) / weekly_ma30 if len(df_weekly) >= 34 else 0.0
@@ -126,11 +128,9 @@ def calculate_metrics(sym, df, bench_series, itype):
     high52 = float(high.iloc[-min(n, 252):].max())
     low52 = float(low.iloc[-min(n, 252):].min())
 
-    # Authentic Minervini Slopes (Lookback ~1 month)
     slope150 = (ma150 - float(close.rolling(150).mean().iloc[-22])) / ma150 if n >= 172 else 0.0
     slope200 = (ma200 - float(close.rolling(200).mean().iloc[-22])) / ma200 if n >= 222 else 0.0
 
-    # Minervini Criteria
     checklist = {
         "Price > 150 & 200 MA": price > ma150 and price > ma200,
         "150 MA > 200 MA": ma150 > ma200,
@@ -141,7 +141,6 @@ def calculate_metrics(sym, df, bench_series, itype):
         "Price Within 25% of 52W High": price >= (high52 * 0.75)
     }
 
-    # Discrete Non-Overlapping Quarterly RS
     def get_ret(d_start, d_end): return (float(close.iloc[-d_end]) - float(close.iloc[-d_start])) / float(close.iloc[-d_start]) if n > d_start else 0.0
     ret_q1 = get_ret(63, 1)
     ret_q2 = get_ret(126, 64)
@@ -149,7 +148,6 @@ def calculate_metrics(sym, df, bench_series, itype):
     ret_q4 = get_ret(252, 190)
     raw_rs = (0.40 * ret_q1) + (0.20 * ret_q2) + (0.20 * ret_q3) + (0.20 * ret_q4)
 
-    # Volume & Liquidity
     avg_vol20 = float(volume.iloc[-21:-1].mean()) if n >= 21 else 1.0
     avg_vol50 = float(volume.iloc[-51:-1].mean()) if n >= 51 else avg_vol20
     curr_vol = float(volume.iloc[-1])
@@ -157,7 +155,6 @@ def calculate_metrics(sym, df, bench_series, itype):
     adtv = avg_vol20 * price
     adtv_fmt = f"${adtv/1e6:.1f}M" if adtv >= 1e6 else f"${round(adtv/1e3)}k"
 
-    # Authentic Weinstein Stages (Including Stage 3)
     if price >= weekly_ma30 * 0.98:
         if weekly_slope >= -0.005:
             if (high52 - price) / high52 <= 0.08: stage, stage_raw = "Stage 2A (Early Markup)", "2A"
@@ -175,7 +172,6 @@ def calculate_metrics(sym, df, bench_series, itype):
     else:
         stage, stage_raw = "Stage 1 (Basing)", "1"
 
-    # Advanced Setups (VCP Contraction & Volume Dry Up)
     range_5d = float(high.iloc[-5:].max() - low.iloc[-5:].min()) if n >= 5 else 0
     range_20d = float(high.iloc[-20:].max() - low.iloc[-20:].min()) if n >= 20 else 0
     vdu = curr_vol < (avg_vol50 * 0.5)
@@ -185,7 +181,6 @@ def calculate_metrics(sym, df, bench_series, itype):
     elif price > ma50 and rvol >= 1.5 and change > 0: setup = "Pocket Pivot"
     else: setup = "Trend Continuation"
 
-    # Mansfield RS Series (Aligned Exact Index)
     mrs_series = []
     if bench_series is not None:
         bench_series.index = pd.to_datetime(bench_series.index).tz_localize(None)
@@ -221,8 +216,8 @@ def main():
     raw_data, err = load_all_market_data(bench_info["symbol"])
     if err or raw_data is None: st.error(f"Market feed error: {err}"); return
 
-    # Explicit Benchmark Integrity Check
-    if bench_info["symbol"] not in raw_data or len(raw_data[bench_info["symbol"]].dropna()) < 50:
+    # Fixed Integrity Check: Dropping subsets of "Close" prevents Volume NaNs from wiping the dataframe
+    if bench_info["symbol"] not in raw_data or len(raw_data[bench_info["symbol"]].dropna(subset=["Close"])) < 50:
         st.error(f"Failed to fetch sufficient benchmark data for {bench_info['symbol']}. Halting scan to prevent false regime data.")
         return
 
@@ -235,7 +230,6 @@ def main():
     processed_list = []
     missing_data = []
     
-    # Process Tickers & Track Missing Data
     for sym, meta in UNIVERSE.items():
         df_sym = raw_data[sym].dropna(subset=["Close"]) if sym in raw_data else None
         if df_sym is not None and len(df_sym) >= 130:
@@ -248,11 +242,8 @@ def main():
             missing_data.append(sym)
 
     if not processed_list: st.warning("No instruments passed data validation."); return
-
-    # Report Missing Instruments safely
     if missing_data: st.toast(f"Excluded due to missing/insufficient data: {', '.join(missing_data)}")
 
-    # Rank Percentile RS
     processed_list.sort(key=lambda x: x["raw_rs"])
     for idx, item in enumerate(processed_list):
         item["rs"] = max(1, min(99, round(((idx + 1) / len(processed_list)) * 99)))
@@ -261,7 +252,6 @@ def main():
 
     df_all = pd.DataFrame(processed_list)
 
-    # Calculate Authentic Live Market Breadth
     total_u = len(df_all)
     pct_50 = (df_all["above_50"].sum() / total_u * 100.0) if total_u > 0 else 0.0
     pct_200 = (df_all["above_200"].sum() / total_u * 100.0) if total_u > 0 else 0.0
@@ -301,23 +291,46 @@ def main():
     if setup_filter != "All Setups": df = df[df["setup"] == setup_filter]
     df = df[df["rs"] >= min_rs]
 
-    st.dataframe(
-        df[["starred", "ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].sort_values(by="rs", ascending=False),
-        use_container_width=True, hide_index=True, height=380
+    # Structure DataFrame for Display & Selection Map
+    df_display = df[["starred", "ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].sort_values(by="rs", ascending=False).reset_index(drop=True)
+
+    # Interactive Clickable Dataframe
+    event = st.dataframe(
+        df_display,
+        use_container_width=True, hide_index=True, height=380,
+        on_select="rerun",
+        selection_mode="single_row"
     )
+
+    # Map selected row to session state
+    curr_sel = event.selection.rows
+    if curr_sel != st.session_state.last_df_selection:
+        st.session_state.last_df_selection = curr_sel
+        if curr_sel:
+            st.session_state.active_ticker = df_display.iloc[curr_sel[0]]["ticker"]
 
     if len(df_all) > 0:
         with st.expander("🔍 **Analyze Instrument & 3-Panel Technical Chart**", expanded=True):
             d_col1, d_col2 = st.columns([1.1, 2.1])
-            selected_ticker = d_col1.selectbox("Select Instrument:", df_all["ticker"].tolist())
-            selected_row = df_all[df_all["ticker"] == selected_ticker].iloc[0]
+            
+            all_tickers = sorted(df_all["ticker"].tolist())
+            if not st.session_state.active_ticker or st.session_state.active_ticker not in all_tickers:
+                st.session_state.active_ticker = all_tickers[0]
+
+            def dropdown_callback():
+                st.session_state.active_ticker = st.session_state.insp_dropdown
+
+            sel_idx = all_tickers.index(st.session_state.active_ticker)
+            d_col1.selectbox("Select Instrument:", all_tickers, index=sel_idx, key="insp_dropdown", on_change=dropdown_callback)
+            
+            selected_row = df_all[df_all["ticker"] == st.session_state.active_ticker].iloc[0]
 
             if d_col1.button("Toggle Watchlist", use_container_width=True):
-                if selected_ticker in st.session_state.watchlist: st.session_state.watchlist.remove(selected_ticker)
-                else: st.session_state.watchlist.add(selected_ticker)
+                if st.session_state.active_ticker in st.session_state.watchlist: st.session_state.watchlist.remove(st.session_state.active_ticker)
+                else: st.session_state.watchlist.add(st.session_state.active_ticker)
                 update_query_watchlist(); st.rerun()
 
-            d_col1.markdown(f'<a href="https://www.tradingview.com/chart/?symbol=ASX:{selected_ticker}" target="_blank"><button style="width:100%; padding:7px; border-radius:6px; background:#1e40af; color:white; font-weight:700; border:none; margin-top:4px;">📈 Open in TradingView</button></a>', unsafe_allow_html=True)
+            d_col1.markdown(f'<a href="https://www.tradingview.com/chart/?symbol=ASX:{st.session_state.active_ticker}" target="_blank"><button style="width:100%; padding:7px; border-radius:6px; background:#1e40af; color:white; font-weight:700; border:none; margin-top:4px;">📈 Open in TradingView</button></a>', unsafe_allow_html=True)
             
             d_col1.markdown("<div style='margin-top:10px; font-weight:700; font-size:0.75rem; text-transform:uppercase;'>Minervini Trend Checklist:</div>", unsafe_allow_html=True)
             for k, v in selected_row["checklist"].items():
