@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.3)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.4)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -11,10 +11,11 @@ Refactored Engine:
   - Phase 4: Timezone-stripped DatetimeIndex for safe resampling.
   - Phase 4: `auto_adjust` removed to prevent yfinance deprecation errors.
   - Phase 4: `fillna(method='ffill')` patched to `ffill()` to resolve Pandas TypeError.
-  - Phase 4: Implemented Clickable Interactive Dataframe -> Chart sync.
-  - PATCH: Fixed StreamlitValueError by changing "single_row" to "single-row".
-  - PATCH: Added .ffill() to raw data to prevent Yahoo NaNs from excluding stocks (SPR, DEG).
-  - PATCH: Added automatic failover to ^AXJO if ^AXAO data is missing from Yahoo Finance.
+  - Phase 4: Fixed StreamlitValueError by changing "single_row" to "single-row".
+  - Phase 4: Added .ffill() to raw data to prevent Yahoo NaNs from excluding stocks.
+  - PATCH 1: Table-to-Chart Sync fixed via session_state bridge & forced rerun.
+  - PATCH 2: AXAO Benchmark fallback removed, ffill() applied with Date Warning Banner.
+  - PATCH 3: 6-Month Historical Sparkline generator added for all Breadth KPI Cards.
 ==============================================================================
 """
 
@@ -81,6 +82,8 @@ if "active_ticker" not in st.session_state:
     st.session_state.active_ticker = None
 if "last_df_selection" not in st.session_state:
     st.session_state.last_df_selection = []
+if "insp_dropdown" not in st.session_state:
+    st.session_state.insp_dropdown = None
 
 def update_query_watchlist():
     st.query_params["wl"] = ",".join(st.session_state.watchlist)
@@ -98,12 +101,60 @@ def make_sparkline_svg(values, stroke_color="#22c55e", fill_color="rgba(34, 197,
 
 @st.cache_data(ttl=3600)
 def load_all_market_data(bench_symbol):
-    symbols = list(set(list(UNIVERSE.keys()) + [bench_symbol, "^AXJO"]))
+    symbols = list(set(list(UNIVERSE.keys()) + [bench_symbol]))
     try:
         data = yf.download(symbols, period="2y", interval="1d", progress=False, group_by="ticker")
         return data, None
     except Exception as e:
         return None, str(e)
+
+def get_historical_breadth(raw_data, universe_keys, b_df_index):
+    """Calculates 6-month historical breadth data for sparkline charts."""
+    target_idx = b_df_index[-125:] # Approx 6 months of trading days
+    
+    count_50 = pd.Series(0, index=target_idx)
+    count_200 = pd.Series(0, index=target_idx)
+    count_2a = pd.Series(0, index=target_idx)
+    count_3 = pd.Series(0, index=target_idx)
+    count_uni = pd.Series(0, index=target_idx)
+
+    for sym in universe_keys:
+        if sym not in raw_data: continue
+        df = raw_data[sym].ffill().dropna(subset=["Close"])
+        if len(df) < 200: continue
+        
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        close = df['Close']
+        high = df['High']
+        
+        ma50 = close.rolling(50).mean()
+        ma200 = close.rolling(200).mean()
+        
+        # Fast Weekly 30-MA mapping
+        df_weekly = close.resample('W-FRI').last()
+        w_ma30 = df_weekly.rolling(30).mean()
+        w_slope = (w_ma30 - w_ma30.shift(4)) / w_ma30
+        
+        w_ma30_d = w_ma30.reindex(close.index).ffill()
+        w_slope_d = w_slope.reindex(close.index).ffill()
+        high52 = high.rolling(252, min_periods=100).max()
+        
+        is_2a = ((close >= w_ma30_d * 0.98) & (w_slope_d >= -0.005) & ((high52 - close) / high52 <= 0.08))
+        is_3 = ((close < w_ma30_d) & (w_slope_d > -0.01) & ((high52 - close) / high52 < 0.15))
+        
+        # Align booleans to target index and sum
+        count_50 += (close > ma50).astype(int).reindex(target_idx).fillna(0)
+        count_200 += (close > ma200).astype(int).reindex(target_idx).fillna(0)
+        count_2a += is_2a.astype(int).reindex(target_idx).fillna(0)
+        count_3 += is_3.astype(int).reindex(target_idx).fillna(0)
+        count_uni += close.notna().astype(int).reindex(target_idx).fillna(0)
+
+    # Protect against div zero
+    safe_uni = count_uni.replace(0, 1)
+    pct_50 = (count_50 / safe_uni * 100).tolist()
+    pct_200 = (count_200 / safe_uni * 100).tolist()
+    
+    return pct_50, pct_200, count_2a.tolist(), count_3.tolist(), count_uni.tolist()
 
 def calculate_metrics(sym, df, bench_series, itype):
     df.index = pd.to_datetime(df.index).tz_localize(None)
@@ -218,30 +269,28 @@ def main():
     raw_data, err = load_all_market_data(bench_info["symbol"])
     if err or raw_data is None: st.error(f"Market feed error: {err}"); return
 
-    # Robust Benchmark Extraction & Automatic Fallback to ^AXJO
+    # Robust Benchmark Extraction & Date Warning Info Banner
     b_df = None
     if bench_info["symbol"] in raw_data:
         b_df = raw_data[bench_info["symbol"]].ffill().dropna(subset=["Close"])
         
     if b_df is None or len(b_df) < 50:
-        if bench_info["symbol"] == "^AXAO" and "^AXJO" in raw_data:
-            st.warning("Yahoo Finance returned blank data for the All Ordinaries (^AXAO). Automatically falling back to the ASX 200 (^AXJO) to maintain operation.")
-            bench_info = BENCHMARK_MAP["S&P/ASX 200 (^AXJO)"]
-            b_df = raw_data["^AXJO"].ffill().dropna(subset=["Close"])
-        
-        if b_df is None or len(b_df) < 50:
-            st.error(f"Failed to fetch sufficient benchmark data for {bench_info['symbol']}. Halting scan to prevent false regime data.")
-            return
+        st.error(f"Failed to fetch sufficient benchmark data for {bench_info['symbol']}. Halting scan to prevent false regime data.")
+        return
+
+    # Extract date of last valid point and print subtle warning info
+    b_df.index = pd.to_datetime(b_df.index).tz_localize(None)
+    last_valid_date = b_df.index[-1].strftime('%d %b %Y')
+    st.info(f"💡 **Benchmark Data Note:** {bench_info['name']} ({bench_info['symbol']}) is utilizing the last valid closing data from **{last_valid_date}**.")
 
     bench_price, b_prev = float(b_df["Close"].iloc[-1]), float(b_df["Close"].iloc[-2])
     bench_change = ((bench_price - b_prev) / b_prev) * 100.0
     power_trend_on = float(b_df["Close"].ewm(span=21).mean().iloc[-1]) > float(b_df["Close"].rolling(50).mean().iloc[-1])
-    bench_spark_vals = b_df["Close"].iloc[-60:].tolist()
+    bench_spark_vals = b_df["Close"].iloc[-125:].tolist()
 
     processed_list = []
     missing_data = []
     
-    # Process Tickers (Forward-filling to prevent Yahoo NaN drops for stocks like SPR and DEG)
     for sym, meta in UNIVERSE.items():
         df_sym = raw_data[sym].ffill().dropna(subset=["Close"]) if sym in raw_data else None
         if df_sym is not None and len(df_sym) >= 130:
@@ -264,6 +313,9 @@ def main():
 
     df_all = pd.DataFrame(processed_list)
 
+    # Fetch 6-Month Historical Data Arrays for Sparklines
+    h_50, h_200, h_2a, h_3, h_uni = get_historical_breadth(raw_data, UNIVERSE.keys(), b_df.index)
+
     total_u = len(df_all)
     pct_50 = (df_all["above_50"].sum() / total_u * 100.0) if total_u > 0 else 0.0
     pct_200 = (df_all["above_200"].sum() / total_u * 100.0) if total_u > 0 else 0.0
@@ -273,17 +325,17 @@ def main():
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     
     with k1:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>{bench_info["short"]} REGIME</span><span style="color:#94a3b8;">{bench_price:,.0f} ({bench_change:+.2f}%)</span></div><div class="kpi-val" style="color:{"#22c55e" if power_trend_on else "#f59e0b"};">{"● Power Trend ON" if power_trend_on else "○ Correction"}</div>{make_sparkline_svg(bench_spark_vals, stroke_color="#22c55e" if power_trend_on else "#f59e0b")}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>{bench_info["short"]} REGIME</span><span style="color:#94a3b8;">{bench_price:,.0f} ({bench_change:+.2f}%)</span></div><div class="kpi-val" style="color:{"#22c55e" if power_trend_on else "#f59e0b"};">{"● Power Trend ON" if power_trend_on else "○ Correction"}</div>{make_sparkline_svg(bench_spark_vals, stroke_color="#22c55e" if power_trend_on else "#f59e0b", fill_color="rgba(34,197,94,0.15)" if power_trend_on else "rgba(245,158,11,0.15)")}</div>', unsafe_allow_html=True)
     with k2:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>% &gt; 50-DAY MA</span></div><div class="kpi-val" style="color:#f8fafc;">{pct_50:.1f}%</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>% &gt; 50-DAY MA</span></div><div class="kpi-val" style="color:#f8fafc;">{pct_50:.1f}%</div>{make_sparkline_svg(h_50, stroke_color="#38bdf8", fill_color="rgba(56,189,248,0.15)")}</div>', unsafe_allow_html=True)
     with k3:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>% &gt; 200-DAY MA</span></div><div class="kpi-val" style="color:#f8fafc;">{pct_200:.1f}%</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>% &gt; 200-DAY MA</span></div><div class="kpi-val" style="color:#f8fafc;">{pct_200:.1f}%</div>{make_sparkline_svg(h_200, stroke_color="#818cf8", fill_color="rgba(129,140,248,0.15)")}</div>', unsafe_allow_html=True)
     with k4:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>STAGE 2A LEADERS</span></div><div class="kpi-val" style="color:#22c55e;">{stage_2a_count} Breaking Out</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>STAGE 2A LEADERS</span></div><div class="kpi-val" style="color:#22c55e;">{stage_2a_count} Breaking Out</div>{make_sparkline_svg(h_2a, stroke_color="#22c55e", fill_color="rgba(34,197,94,0.15)")}</div>', unsafe_allow_html=True)
     with k5:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>STAGE 3 DISTRIBUTION</span></div><div class="kpi-val" style="color:#f43f5e;">{stage_3_count} Topping</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>STAGE 3 DISTRIBUTION</span></div><div class="kpi-val" style="color:#f43f5e;">{stage_3_count} Topping</div>{make_sparkline_svg(h_3, stroke_color="#f43f5e", fill_color="rgba(244,63,94,0.15)")}</div>', unsafe_allow_html=True)
     with k6:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>UNIVERSE</span></div><div class="kpi-val" style="color:#c084fc;">{total_u} Scanned</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>UNIVERSE</span></div><div class="kpi-val" style="color:#c084fc;">{total_u} Scanned</div>{make_sparkline_svg(h_uni, stroke_color="#c084fc", fill_color="rgba(192,132,252,0.15)")}</div>', unsafe_allow_html=True)
 
     st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
     with st.container(border=True):
@@ -306,7 +358,7 @@ def main():
     # Structure DataFrame for Display & Selection Map
     df_display = df[["starred", "ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].sort_values(by="rs", ascending=False).reset_index(drop=True)
 
-    # Interactive Clickable Dataframe (Using "single-row" with hyphen)
+    # Interactive Clickable Dataframe
     event = st.dataframe(
         df_display,
         use_container_width=True, height=380,
@@ -314,12 +366,15 @@ def main():
         selection_mode="single-row"
     )
 
-    # Map selected row to session state
+    # Force chart sync via Session State bridge when table row is clicked
     curr_sel = event.selection.rows
     if curr_sel != st.session_state.last_df_selection:
         st.session_state.last_df_selection = curr_sel
         if curr_sel:
-            st.session_state.active_ticker = df_display.iloc[curr_sel[0]]["ticker"]
+            clicked_ticker = df_display.iloc[curr_sel[0]]["ticker"]
+            st.session_state.active_ticker = clicked_ticker
+            st.session_state.insp_dropdown = clicked_ticker
+            st.rerun()
 
     if len(df_all) > 0:
         with st.expander("🔍 **Analyze Instrument & 3-Panel Technical Chart**", expanded=True):
