@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v8.0)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v8.1)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -17,6 +17,7 @@ Refactored Engine:
   - UPDATE: Consolidated Header into Action Ribbon.
   - NEW: Dynamic Universe Integration (Live ASX Directory Scraping via Markit API).
   - NEW: Distance to Pivot (%) calculation added to identify tight base breakouts.
+  - PATCH 11: Added ZeroDivisionError safeguards for defunct stocks in the full market feed.
 ==============================================================================
 """
 
@@ -45,7 +46,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Fallback Universe to prevent crashes if the ASX API blocks the request
 FALLBACK_UNIVERSE = {
     "DRO.AX": {"name": "Droneshield", "type": "Equity", "theme": "Defense"},
     "SPR.AX": {"name": "Spartan Resources", "type": "Equity", "theme": "Gold"},
@@ -66,7 +66,6 @@ BENCHMARK_MAP = {
     "S&P/ASX 200 (^AXJO)": {"symbol": "^AXJO", "short": "AXJO", "name": "ASX 200"}
 }
 
-# Initialize Session State Variables
 if "watchlist" not in st.session_state:
     query_wl = st.query_params.get("wl", "")
     st.session_state.watchlist = set(query_wl.split(",")) if query_wl else set(["DRO", "SPR", "DYL"])
@@ -78,14 +77,12 @@ if "show_starred_only" not in st.session_state: st.session_state.show_starred_on
 def update_query_watchlist():
     st.query_params["wl"] = ",".join(st.session_state.watchlist)
 
-@st.cache_data(ttl=43200) # Cache for 12 hours to avoid spamming the ASX endpoint
+@st.cache_data(ttl=43200)
 def fetch_dynamic_universe():
-    """Scrapes the live official ASX listed company directory."""
     try:
         url = "https://asx.api.markitdigital.com/asx-research/1.0/companies/directory/file?access_token=83ff96335c2d45a094df02a206a39ff4"
         df = pd.read_csv(url)
         df = df.dropna(subset=['ASX code'])
-        # Rigid pre-filter: Keep only standard 3-character equity codes (strips out warrants & options)
         df = df[df['ASX code'].str.match(r'^[A-Z]{3}$')]
         
         dynamic_universe = {}
@@ -186,7 +183,9 @@ def calculate_metrics(sym, df, bench_series, itype):
     n = len(close)
 
     price = float(close.iloc[-1])
-    change = ((price - float(close.iloc[-2])) / float(close.iloc[-2])) * 100.0 if n >= 2 else 0.0
+    # Prevent divide by zero on daily change
+    prev_price = float(close.iloc[-2]) if n >= 2 else price
+    change = ((price - prev_price) / prev_price) * 100.0 if prev_price > 0.0 else 0.0
 
     ma50 = float(close.rolling(50).mean().iloc[-1])
     ma150 = float(close.rolling(150).mean().iloc[-1])
@@ -203,9 +202,8 @@ def calculate_metrics(sym, df, bench_series, itype):
     slope150 = (ma150 - float(close.rolling(150).mean().iloc[-22])) / ma150 if n >= 172 else 0.0
     slope200 = (ma200 - float(close.rolling(200).mean().iloc[-22])) / ma200 if n >= 222 else 0.0
 
-    # DISTANCE TO PIVOT CALCULATION (50-Day Local Consolidation High)
     pivot_50d = float(high.iloc[-50:].max()) if n >= 50 else float(high.max())
-    pivot_dist = ((pivot_50d - price) / price) * 100.0 if price > 0 else 0.0
+    pivot_dist = ((pivot_50d - price) / price) * 100.0 if price > 0.0 else 0.0
 
     checklist = {
         "Price > 150 & 200 MA": price > ma150 and price > ma200,
@@ -217,7 +215,12 @@ def calculate_metrics(sym, df, bench_series, itype):
         "Price Within 25% of 52W High": price >= (high52 * 0.75)
     }
 
-    def get_ret(d_start, d_end): return (float(close.iloc[-d_end]) - float(close.iloc[-d_start])) / float(close.iloc[-d_start]) if n > d_start else 0.0
+    # Safe Return Calculation to prevent ZeroDivisionError on defunct market listings
+    def get_ret(d_start, d_end):
+        if n <= d_start: return 0.0
+        p_start = float(close.iloc[-d_start])
+        return (float(close.iloc[-d_end]) - p_start) / p_start if p_start > 0.0 else 0.0
+
     ret_q1 = get_ret(63, 1)
     ret_q2 = get_ret(126, 64)
     ret_q3 = get_ret(189, 127)
@@ -299,12 +302,10 @@ def main():
         universe_mode = c_u1.radio("Scanner Mode", ["Core & Watchlist (Fast)", "ASX Full Market (Slower EOD)"], horizontal=True, label_visibility="collapsed")
         bench_choice = c_u2.selectbox("Benchmark", list(BENCHMARK_MAP.keys()), index=0, label_visibility="collapsed")
 
-    # Dynamic Universe Injection
     if universe_mode == "ASX Full Market (Slower EOD)":
         active_universe = fetch_dynamic_universe()
         st.caption("⚡ **Engine Note:** Pulling 2-years of historical data for ~1,900 active ASX equities. This EOD scan may take 60-90 seconds.")
     else:
-        # Build swift mini-universe from fallback list + anything currently starred
         active_universe = FALLBACK_UNIVERSE.copy()
         for sym in st.session_state.watchlist:
             full_sym = f"{sym}.AX"
