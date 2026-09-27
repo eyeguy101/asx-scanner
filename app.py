@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.2)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.3)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -11,9 +11,10 @@ Refactored Engine:
   - Phase 4: Timezone-stripped DatetimeIndex for safe resampling.
   - Phase 4: `auto_adjust` removed to prevent yfinance deprecation errors.
   - Phase 4: `fillna(method='ffill')` patched to `ffill()` to resolve Pandas TypeError.
-  - Phase 4: Fixed Benchmark Volume NaN crash by isolating subset=["Close"].
   - Phase 4: Implemented Clickable Interactive Dataframe -> Chart sync.
-  - Phase 4: Resolved StreamlitValueError by removing hide_index=True conflict with row selection.
+  - PATCH: Fixed StreamlitValueError by changing "single_row" to "single-row".
+  - PATCH: Added .ffill() to raw data to prevent Yahoo NaNs from excluding stocks (SPR, DEG).
+  - PATCH: Added automatic failover to ^AXJO if ^AXAO data is missing from Yahoo Finance.
 ==============================================================================
 """
 
@@ -97,7 +98,7 @@ def make_sparkline_svg(values, stroke_color="#22c55e", fill_color="rgba(34, 197,
 
 @st.cache_data(ttl=3600)
 def load_all_market_data(bench_symbol):
-    symbols = list(set(list(UNIVERSE.keys()) + [bench_symbol]))
+    symbols = list(set(list(UNIVERSE.keys()) + [bench_symbol, "^AXJO"]))
     try:
         data = yf.download(symbols, period="2y", interval="1d", progress=False, group_by="ticker")
         return data, None
@@ -217,12 +218,21 @@ def main():
     raw_data, err = load_all_market_data(bench_info["symbol"])
     if err or raw_data is None: st.error(f"Market feed error: {err}"); return
 
-    # Fixed Integrity Check: Dropping subsets of "Close" prevents Volume NaNs from wiping the dataframe
-    if bench_info["symbol"] not in raw_data or len(raw_data[bench_info["symbol"]].dropna(subset=["Close"])) < 50:
-        st.error(f"Failed to fetch sufficient benchmark data for {bench_info['symbol']}. Halting scan to prevent false regime data.")
-        return
+    # Robust Benchmark Extraction & Automatic Fallback to ^AXJO
+    b_df = None
+    if bench_info["symbol"] in raw_data:
+        b_df = raw_data[bench_info["symbol"]].ffill().dropna(subset=["Close"])
+        
+    if b_df is None or len(b_df) < 50:
+        if bench_info["symbol"] == "^AXAO" and "^AXJO" in raw_data:
+            st.warning("Yahoo Finance returned blank data for the All Ordinaries (^AXAO). Automatically falling back to the ASX 200 (^AXJO) to maintain operation.")
+            bench_info = BENCHMARK_MAP["S&P/ASX 200 (^AXJO)"]
+            b_df = raw_data["^AXJO"].ffill().dropna(subset=["Close"])
+        
+        if b_df is None or len(b_df) < 50:
+            st.error(f"Failed to fetch sufficient benchmark data for {bench_info['symbol']}. Halting scan to prevent false regime data.")
+            return
 
-    b_df = raw_data[bench_info["symbol"]].dropna(subset=["Close"])
     bench_price, b_prev = float(b_df["Close"].iloc[-1]), float(b_df["Close"].iloc[-2])
     bench_change = ((bench_price - b_prev) / b_prev) * 100.0
     power_trend_on = float(b_df["Close"].ewm(span=21).mean().iloc[-1]) > float(b_df["Close"].rolling(50).mean().iloc[-1])
@@ -231,8 +241,9 @@ def main():
     processed_list = []
     missing_data = []
     
+    # Process Tickers (Forward-filling to prevent Yahoo NaN drops for stocks like SPR and DEG)
     for sym, meta in UNIVERSE.items():
-        df_sym = raw_data[sym].dropna(subset=["Close"]) if sym in raw_data else None
+        df_sym = raw_data[sym].ffill().dropna(subset=["Close"]) if sym in raw_data else None
         if df_sym is not None and len(df_sym) >= 130:
             m = calculate_metrics(sym, df_sym, b_df["Close"], meta["type"])
             if m:
@@ -295,12 +306,12 @@ def main():
     # Structure DataFrame for Display & Selection Map
     df_display = df[["starred", "ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].sort_values(by="rs", ascending=False).reset_index(drop=True)
 
-    # Interactive Clickable Dataframe (hide_index=True removed to support selection)
+    # Interactive Clickable Dataframe (Using "single-row" with hyphen)
     event = st.dataframe(
         df_display,
         use_container_width=True, height=380,
         on_select="rerun",
-        selection_mode="single_row"
+        selection_mode="single-row"
     )
 
     # Map selected row to session state
