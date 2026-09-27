@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v7.1)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v7.2)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -22,6 +22,7 @@ Refactored Engine:
   - UPDATE: Consolidated Header into Action Ribbon (Fetch / Export / Starred Toggle).
   - UPDATE: Compacted Filter Bar with inline Reset layout.
   - PATCH 8: Resolved st.data_editor TypeError by removing on_select and adding an interactive CHART action column.
+  - PATCH 9: Fixed data_editor infinite rerun loop by clearing session_state[editor_key].
 ==============================================================================
 """
 
@@ -85,6 +86,8 @@ if "watchlist" not in st.session_state:
     st.session_state.watchlist = set(query_wl.split(",")) if query_wl else set(["DRO", "SPR", "DYL", "ATOM"])
 if "active_ticker" not in st.session_state:
     st.session_state.active_ticker = None
+if "last_df_selection" not in st.session_state:
+    st.session_state.last_df_selection = []
 if "insp_dropdown" not in st.session_state:
     st.session_state.insp_dropdown = None
 if "show_starred_only" not in st.session_state:
@@ -420,7 +423,7 @@ def main():
         key=editor_key
     )
 
-    if st.session_state[editor_key].get("edited_rows"):
+    if editor_key in st.session_state and st.session_state[editor_key].get("edited_rows"):
         rerun_needed = False
         for row_idx, edit in st.session_state[editor_key]["edited_rows"].items():
             if "STARRED" in edit:
@@ -439,6 +442,7 @@ def main():
                 rerun_needed = True
                 
         if rerun_needed:
+            del st.session_state[editor_key]
             st.rerun()
 
     if len(df_all) > 0:
