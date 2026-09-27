@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.1)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.2)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -13,6 +13,7 @@ Refactored Engine:
   - Phase 4: `fillna(method='ffill')` patched to `ffill()` to resolve Pandas TypeError.
   - Phase 4: Fixed Benchmark Volume NaN crash by isolating subset=["Close"].
   - Phase 4: Implemented Clickable Interactive Dataframe -> Chart sync.
+  - Phase 4: Resolved StreamlitValueError by removing hide_index=True conflict with row selection.
 ==============================================================================
 """
 
@@ -294,10 +295,10 @@ def main():
     # Structure DataFrame for Display & Selection Map
     df_display = df[["starred", "ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].sort_values(by="rs", ascending=False).reset_index(drop=True)
 
-    # Interactive Clickable Dataframe
+    # Interactive Clickable Dataframe (hide_index=True removed to support selection)
     event = st.dataframe(
         df_display,
-        use_container_width=True, hide_index=True, height=380,
+        use_container_width=True, height=380,
         on_select="rerun",
         selection_mode="single_row"
     )
