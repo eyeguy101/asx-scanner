@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v9.0)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v9.1)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -16,9 +16,10 @@ Refactored Engine:
   - PATCH 11: Added ZeroDivisionError safeguards for defunct stocks.
   - UPDATE: Dynamic Universe Integration (Live ASX Directory Scraping via Markit API).
   - UPDATE: Distance to Pivot (%) calculation added to identify tight base breakouts.
-  - NEW/FIX: Hardened Weinstein Stage logic based on 30w MA smoothed slopes.
-  - NEW/FIX: Enforced Minervini Trend Template prerequisites for all VCP setups.
-  - NEW/FIX: Added base depth and positional constraints to block falling knife false positives.
+  - UPDATE: Hardened Weinstein Stage logic based on 30w MA smoothed slopes.
+  - UPDATE: Enforced Minervini Trend Template prerequisites for all VCP setups.
+  - UPDATE: Added base depth and positional constraints to block falling knife false positives.
+  - NEW: Integrated dropdown Price Filter (e.g., > $0.10) to strip illiquid penny stocks.
 ==============================================================================
 """
 
@@ -194,7 +195,6 @@ def calculate_metrics(sym, df, bench_series, itype):
     
     df_weekly = df.resample('W-FRI').last().dropna(subset=["Close"])
     weekly_ma30 = float(df_weekly["Close"].rolling(30).mean().iloc[-1]) if len(df_weekly) >= 30 else ma150
-    # Smoothed slope to prevent false stage transitions on whipsaws
     weekly_slope = (weekly_ma30 - float(df_weekly["Close"].rolling(30).mean().iloc[-4])) / weekly_ma30 if len(df_weekly) >= 34 else 0.0
 
     high52 = float(high.iloc[-min(n, 252):].max())
@@ -216,7 +216,6 @@ def calculate_metrics(sym, df, bench_series, itype):
         "Price Within 25% of 52W High": price >= (high52 * 0.75)
     }
 
-    # TT STRICT PASS: Must satisfy structural moving average bounds to qualify for VCP/Breakouts
     tt_pass = checklist["Price > 150 & 200 MA"] and checklist["Price > 50 MA"]
 
     def get_ret(d_start, d_end):
@@ -237,13 +236,9 @@ def calculate_metrics(sym, df, bench_series, itype):
     adtv = avg_vol20 * price
     adtv_fmt = f"${adtv/1e6:.1f}M" if adtv >= 1e6 else f"${round(adtv/1e3)}k"
 
-    # ==========================================
-    # HARDENED WEINSTEIN STAGE LOGIC
-    # ==========================================
     stage_raw = "1"
     stage = "Stage 1 (Basing)"
     
-    # ADVANCING PHASE: Tangibly rising 30w MA
     if price >= weekly_ma30 * 0.98 and weekly_slope > 0.002: 
         if (price - weekly_ma30) / weekly_ma30 > 0.25:
             stage, stage_raw = "Stage 2B (Late Uptrend)", "2B"
@@ -252,22 +247,15 @@ def calculate_metrics(sym, df, bench_series, itype):
         else:
             stage, stage_raw = "Stage 2 (Advancing)", "2"
             
-    # DECLINING PHASE: Tangibly declining 30w MA, price below it
     elif price < weekly_ma30 * 0.98 and weekly_slope < -0.002:
         stage, stage_raw = "Stage 4 (Downtrend)", "4"
         
-    # TRANSITIONAL FUZZINESS (Flattening MA)
     elif weekly_slope <= 0.002 and weekly_slope >= -0.005:
         if (high52 - price) / high52 < 0.20 and price < weekly_ma30 * 1.05 and price > weekly_ma30 * 0.85:
-            # Whipsawing near highs, losing upside momentum
             stage, stage_raw = "Stage 3 (Distribution)", "3"
         else:
-            # Flattening out low in the chart
             stage, stage_raw = "Stage 1 (Basing)", "1"
 
-    # ==========================================
-    # HARDENED MINERVINI SETUP LOGIC
-    # ==========================================
     max_20d = float(high.iloc[-20:].max()) if n >= 20 else price
     min_20d = float(low.iloc[-20:].min()) if n >= 20 else price
     range_20d_pct = (max_20d - min_20d) / min_20d if min_20d > 0 else 0
@@ -281,15 +269,11 @@ def calculate_metrics(sym, df, bench_series, itype):
 
     setup = "Trend Continuation"
     
-    # Must be structurally sound (Trend Template + Stage 2) to trigger constructive setups
     if tt_pass and stage_raw in ["2A", "2"]:
-        # VCP: Max depth 25%, Tightness < 6%, closing in upper half, dry volume
         if range_20d_pct <= 0.25 and range_5d_pct <= 0.06 and position_20d > 0.5 and vdu:
             setup = "VCP Contraction"
-        # Breakout: Pushing top 10% of base, big volume, strong move
         elif position_20d > 0.90 and rvol >= 1.5 and change > 2.0:
             setup = "Stage 2 Breakout"
-        # Pocket Pivot: Surging inside the base on heavy volume
         elif price > ma50 and rvol >= 1.5 and change > 0 and position_20d > 0.3:
             setup = "Pocket Pivot"
 
@@ -430,20 +414,25 @@ def main():
     st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
     
     with st.container(border=True):
-        f1, f2, f3, f4, f5, f6 = st.columns([2.5, 1.5, 2.0, 1.5, 1.5, 1.0])
+        f1, f2, f3, f4, f5, f6, f7 = st.columns([2.0, 1.2, 1.5, 1.5, 1.5, 1.5, 0.8])
         search_query = f1.text_input("Search", "", placeholder="Search Ticker..", label_visibility="collapsed").strip().lower()
-        substage_filter = f2.selectbox("Stage", ["All Stages", "Stage 2A", "Stage 1B", "Stage 3", "Stage 4"], label_visibility="collapsed")
-        min_rs = f3.slider("Min RS", 0, 95, 0, 5, label_visibility="collapsed")
-        theme_filter = f4.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in active_universe.values()))), label_visibility="collapsed")
-        setup_filter = f5.selectbox("Setup", ["All Setups", "VCP Contraction", "Stage 2 Breakout", "Pocket Pivot"], label_visibility="collapsed")
+        price_filter = f2.selectbox("Price", ["All Prices", "> $0.10", "> $0.50", "> $1.00", "> $5.00", "> $10.00"], label_visibility="collapsed")
+        substage_filter = f3.selectbox("Stage", ["All Stages", "Stage 2A", "Stage 1B", "Stage 3", "Stage 4"], label_visibility="collapsed")
+        min_rs = f4.slider("Min RS", 0, 95, 0, 5, label_visibility="collapsed")
+        theme_filter = f5.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in active_universe.values()))), label_visibility="collapsed")
+        setup_filter = f6.selectbox("Setup", ["All Setups", "VCP Contraction", "Stage 2 Breakout", "Pocket Pivot"], label_visibility="collapsed")
         
-        if f6.button("Reset All", use_container_width=True):
+        if f7.button("Reset All", use_container_width=True):
             st.session_state.show_starred_only = False
             st.cache_data.clear()
             st.rerun()
 
     df = df_all.copy()
     
+    if price_filter != "All Prices":
+        min_price = float(price_filter.replace("> $", ""))
+        df = df[df["price"] > min_price]
+        
     if st.session_state.show_starred_only:
         df = df[df["ticker"].isin(st.session_state.watchlist)]
         
