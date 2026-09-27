@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v7.3)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v8.0)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -10,20 +10,13 @@ Refactored Engine:
   - Phase 2: Live rolling market breadth (no synthetic data).
   - Phase 4: Timezone-stripped DatetimeIndex for safe resampling.
   - Phase 4: `auto_adjust` removed to prevent yfinance deprecation errors.
-  - Phase 4: `fillna(method='ffill')` patched to `ffill()` to resolve Pandas TypeError.
-  - Phase 4: Added .ffill() to raw data to prevent Yahoo NaNs from excluding stocks.
-  - PATCH 3: 6-Month Historical Sparkline generator added for all Breadth KPI Cards.
   - PATCH 4: Split API Fetch to bypass yfinance Multi-Index bug for benchmark.
-  - PATCH 5: Fixed invalid Yahoo Finance ticker symbol for All Ordinaries (^AORD).
-  - PATCH 6: Converted main table to st.data_editor for interactive Watchlist checkboxes.
-  - PATCH 7: Capitalized all dataframe column headers.
+  - PATCH 8: Resolved st.data_editor TypeError with interactive CHART action column.
+  - PATCH 10: Fixed TradingView Widget vertical compression.
   - UPDATE: Embedded Interactive TradingView Advanced Chart Widget.
-  - UPDATE: Added Contextual Trajectory Labels (Rising/Extended/Falling) to Mansfield RS.
-  - UPDATE: Consolidated Header into Action Ribbon (Fetch / Export / Starred Toggle).
-  - UPDATE: Compacted Filter Bar with inline Reset layout.
-  - PATCH 8: Resolved st.data_editor TypeError by removing on_select and adding an interactive CHART action column.
-  - PATCH 9: Fixed data_editor infinite rerun loop by clearing session_state[editor_key].
-  - PATCH 10: Fixed TradingView Widget vertical compression by enforcing hard pixel bounds.
+  - UPDATE: Consolidated Header into Action Ribbon.
+  - NEW: Dynamic Universe Integration (Live ASX Directory Scraping via Markit API).
+  - NEW: Distance to Pivot (%) calculation added to identify tight base breakouts.
 ==============================================================================
 """
 
@@ -52,7 +45,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-UNIVERSE = {
+# Fallback Universe to prevent crashes if the ASX API blocks the request
+FALLBACK_UNIVERSE = {
     "DRO.AX": {"name": "Droneshield", "type": "Equity", "theme": "Defense"},
     "SPR.AX": {"name": "Spartan Resources", "type": "Equity", "theme": "Gold"},
     "DYL.AX": {"name": "Deep Yellow", "type": "Equity", "theme": "Uranium"},
@@ -63,17 +57,8 @@ UNIVERSE = {
     "360.AX": {"name": "Life360", "type": "Equity", "theme": "Tech"},
     "DEG.AX": {"name": "De Grey Mining", "type": "Equity", "theme": "Gold"},
     "NEU.AX": {"name": "Neuren Pharma", "type": "Equity", "theme": "Biotech"},
-    "TUA.AX": {"name": "Tuas Limited", "type": "Equity", "theme": "Telecom"},
-    "ZIP.AX": {"name": "Zip Co", "type": "Equity", "theme": "Fintech"},
     "CBA.AX": {"name": "Commonwealth Bank", "type": "Equity", "theme": "Banking"},
-    "BHP.AX": {"name": "BHP Group", "type": "Equity", "theme": "Resources"},
-    "LTR.AX": {"name": "Liontown Resources", "type": "Equity", "theme": "Lithium"},
-    "ATOM.AX": {"name": "Global Uranium ETF", "type": "ETF", "theme": "Uranium"},
-    "MNRS.AX": {"name": "Global Gold ETF", "type": "ETF", "theme": "Gold"},
-    "HACK.AX": {"name": "Cybersecurity ETF", "type": "ETF", "theme": "Tech"},
-    "SEMI.AX": {"name": "Semiconductors ETF", "type": "ETF", "theme": "Tech"},
-    "QRE.AX": {"name": "ASX 200 Resources", "type": "ETF", "theme": "Resources"},
-    "A200.AX": {"name": "Australia 200 ETF", "type": "ETF", "theme": "Broad Market"}
+    "BHP.AX": {"name": "BHP Group", "type": "Equity", "theme": "Resources"}
 }
 
 BENCHMARK_MAP = {
@@ -84,18 +69,39 @@ BENCHMARK_MAP = {
 # Initialize Session State Variables
 if "watchlist" not in st.session_state:
     query_wl = st.query_params.get("wl", "")
-    st.session_state.watchlist = set(query_wl.split(",")) if query_wl else set(["DRO", "SPR", "DYL", "ATOM"])
-if "active_ticker" not in st.session_state:
-    st.session_state.active_ticker = None
-if "last_df_selection" not in st.session_state:
-    st.session_state.last_df_selection = []
-if "insp_dropdown" not in st.session_state:
-    st.session_state.insp_dropdown = None
-if "show_starred_only" not in st.session_state:
-    st.session_state.show_starred_only = False
+    st.session_state.watchlist = set(query_wl.split(",")) if query_wl else set(["DRO", "SPR", "DYL"])
+if "active_ticker" not in st.session_state: st.session_state.active_ticker = None
+if "last_df_selection" not in st.session_state: st.session_state.last_df_selection = []
+if "insp_dropdown" not in st.session_state: st.session_state.insp_dropdown = None
+if "show_starred_only" not in st.session_state: st.session_state.show_starred_only = False
 
 def update_query_watchlist():
     st.query_params["wl"] = ",".join(st.session_state.watchlist)
+
+@st.cache_data(ttl=43200) # Cache for 12 hours to avoid spamming the ASX endpoint
+def fetch_dynamic_universe():
+    """Scrapes the live official ASX listed company directory."""
+    try:
+        url = "https://asx.api.markitdigital.com/asx-research/1.0/companies/directory/file?access_token=83ff96335c2d45a094df02a206a39ff4"
+        df = pd.read_csv(url)
+        df = df.dropna(subset=['ASX code'])
+        # Rigid pre-filter: Keep only standard 3-character equity codes (strips out warrants & options)
+        df = df[df['ASX code'].str.match(r'^[A-Z]{3}$')]
+        
+        dynamic_universe = {}
+        for _, row in df.iterrows():
+            sym = f"{row['ASX code']}.AX"
+            theme = str(row.get('GICS industry group', 'Unclassified')).title()
+            if theme in ["Nan", "Not Applic", "Unclassified"]: theme = "Diversified / Unclassified"
+                
+            dynamic_universe[sym] = {
+                "name": str(row.get('Company name', sym)).title(),
+                "type": "Equity",
+                "theme": theme
+            }
+        return dynamic_universe
+    except Exception as e:
+        return FALLBACK_UNIVERSE
 
 def make_sparkline_svg(values, stroke_color="#22c55e", fill_color="rgba(34, 197, 94, 0.15)", width=180, height=22):
     if not values or len(values) < 2: return ""
@@ -109,8 +115,8 @@ def make_sparkline_svg(values, stroke_color="#22c55e", fill_color="rgba(34, 197,
     return f'<svg width="100%" height="{height}" viewBox="0 0 {width} {height}" style="overflow:visible; display:block; margin-top:3px;"><path d="{fill_d}" fill="{fill_color}" /><path d="{path_d}" fill="none" stroke="{stroke_color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>'
 
 @st.cache_data(ttl=3600)
-def load_all_market_data(bench_symbol):
-    symbols = list(set(UNIVERSE.keys()))
+def load_all_market_data(universe_dict, bench_symbol):
+    symbols = list(set(universe_dict.keys()))
     try:
         df_batch = yf.download(symbols, period="2y", interval="1d", progress=False, group_by="ticker")
         data_dict = {}
@@ -167,10 +173,7 @@ def get_historical_breadth(raw_data, universe_keys, b_df_index):
         count_uni += close.notna().astype(int).reindex(target_idx).fillna(0)
 
     safe_uni = count_uni.replace(0, 1)
-    pct_50 = (count_50 / safe_uni * 100).tolist()
-    pct_200 = (count_200 / safe_uni * 100).tolist()
-    
-    return pct_50, pct_200, count_2a.tolist(), count_3.tolist(), count_uni.tolist()
+    return (count_50 / safe_uni * 100).tolist(), (count_200 / safe_uni * 100).tolist(), count_2a.tolist(), count_3.tolist(), count_uni.tolist()
 
 def calculate_metrics(sym, df, bench_series, itype):
     df.index = pd.to_datetime(df.index).tz_localize(None)
@@ -199,6 +202,10 @@ def calculate_metrics(sym, df, bench_series, itype):
 
     slope150 = (ma150 - float(close.rolling(150).mean().iloc[-22])) / ma150 if n >= 172 else 0.0
     slope200 = (ma200 - float(close.rolling(200).mean().iloc[-22])) / ma200 if n >= 222 else 0.0
+
+    # DISTANCE TO PIVOT CALCULATION (50-Day Local Consolidation High)
+    pivot_50d = float(high.iloc[-50:].max()) if n >= 50 else float(high.max())
+    pivot_dist = ((pivot_50d - price) / price) * 100.0 if price > 0 else 0.0
 
     checklist = {
         "Price > 150 & 200 MA": price > ma150 and price > ma200,
@@ -261,8 +268,8 @@ def calculate_metrics(sym, df, bench_series, itype):
             mrs_series = mrs_curve.reindex(close.index).ffill().iloc[-90:].tolist()
 
     return {
-        "price": price, "change": change, "raw_rs": raw_rs, "adtv": adtv, "adtv_fmt": adtv_fmt,
-        "high52": high52, "checklist": checklist, "trend_score": sum(checklist.values()),
+        "price": price, "change": change, "pivot_dist": pivot_dist, "raw_rs": raw_rs, 
+        "adtv": adtv, "adtv_fmt": adtv_fmt, "checklist": checklist, "trend_score": sum(checklist.values()),
         "stage": stage, "stage_raw": stage_raw, "setup": setup,
         "mrs_series": mrs_series, "above_50": price > ma50, "above_200": price > ma200
     }
@@ -289,11 +296,23 @@ def main():
 
     with st.container(border=True):
         c_u1, c_u2 = st.columns([3, 7])
-        universe_mode = c_u1.radio("Universe", ["All", "Equities", "ETFs"], horizontal=True, label_visibility="collapsed")
+        universe_mode = c_u1.radio("Scanner Mode", ["Core & Watchlist (Fast)", "ASX Full Market (Slower EOD)"], horizontal=True, label_visibility="collapsed")
         bench_choice = c_u2.selectbox("Benchmark", list(BENCHMARK_MAP.keys()), index=0, label_visibility="collapsed")
 
+    # Dynamic Universe Injection
+    if universe_mode == "ASX Full Market (Slower EOD)":
+        active_universe = fetch_dynamic_universe()
+        st.caption("⚡ **Engine Note:** Pulling 2-years of historical data for ~1,900 active ASX equities. This EOD scan may take 60-90 seconds.")
+    else:
+        # Build swift mini-universe from fallback list + anything currently starred
+        active_universe = FALLBACK_UNIVERSE.copy()
+        for sym in st.session_state.watchlist:
+            full_sym = f"{sym}.AX"
+            if full_sym not in active_universe:
+                active_universe[full_sym] = {"name": sym, "type": "Equity", "theme": "Watchlist Addition"}
+
     bench_info = BENCHMARK_MAP[bench_choice]
-    raw_data, err = load_all_market_data(bench_info["symbol"])
+    raw_data, err = load_all_market_data(active_universe, bench_info["symbol"])
     if err or raw_data is None: st.error(f"Market feed error: {err}"); return
 
     b_df = None
@@ -316,7 +335,7 @@ def main():
     processed_list = []
     missing_data = []
     
-    for sym, meta in UNIVERSE.items():
+    for sym, meta in active_universe.items():
         df_sym = raw_data[sym].ffill().dropna(subset=["Close"]) if sym in raw_data else None
         if df_sym is not None and len(df_sym) >= 130:
             m = calculate_metrics(sym, df_sym, b_df["Close"], meta["type"])
@@ -328,7 +347,8 @@ def main():
             missing_data.append(sym)
 
     if not processed_list: st.warning("No instruments passed data validation."); return
-    if missing_data: st.toast(f"Excluded due to missing/insufficient data: {', '.join(missing_data)}")
+    if missing_data and universe_mode == "Core & Watchlist (Fast)": 
+        st.toast(f"Excluded due to missing/insufficient data: {', '.join(missing_data)}")
 
     processed_list.sort(key=lambda x: x["raw_rs"])
     for idx, item in enumerate(processed_list):
@@ -350,7 +370,7 @@ def main():
 
     df_all = pd.DataFrame(processed_list)
 
-    h_50, h_200, h_2a, h_3, h_uni = get_historical_breadth(raw_data, UNIVERSE.keys(), b_df.index)
+    h_50, h_200, h_2a, h_3, h_uni = get_historical_breadth(raw_data, active_universe.keys(), b_df.index)
 
     total_u = len(df_all)
     pct_50 = (df_all["above_50"].sum() / total_u * 100.0) if total_u > 0 else 0.0
@@ -380,7 +400,7 @@ def main():
         search_query = f1.text_input("Search", "", placeholder="Search Ticker..", label_visibility="collapsed").strip().lower()
         substage_filter = f2.selectbox("Stage", ["All Stages", "Stage 2A", "Stage 1B", "Stage 3", "Stage 4"], label_visibility="collapsed")
         min_rs = f3.slider("Min RS", 0, 95, 0, 5, label_visibility="collapsed")
-        theme_filter = f4.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in UNIVERSE.values()))), label_visibility="collapsed")
+        theme_filter = f4.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in active_universe.values()))), label_visibility="collapsed")
         setup_filter = f5.selectbox("Setup", ["All Setups", "VCP Contraction", "Stage 2 Breakout", "Pocket Pivot"], label_visibility="collapsed")
         
         if f6.button("Reset All", use_container_width=True):
@@ -393,16 +413,14 @@ def main():
     if st.session_state.show_starred_only:
         df = df[df["ticker"].isin(st.session_state.watchlist)]
         
-    if universe_mode == "Equities": df = df[df["type"] == "Equity"]
-    elif universe_mode == "ETFs": df = df[df["type"] == "ETF"]
     if search_query: df = df[df["ticker"].str.lower().str.contains(search_query)]
     if theme_filter != "All Themes": df = df[df["theme"] == theme_filter]
     if substage_filter != "All Stages": df = df[df["stage_raw"] == substage_filter.split(" ")[1]]
     if setup_filter != "All Setups": df = df[df["setup"] == setup_filter]
     df = df[df["rs"] >= min_rs]
 
-    df_display = df[["ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].copy()
-    df_display.columns = ["TICKER", "NAME", "PRICE", "TODAY %", "RS", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
+    df_display = df[["ticker", "name", "price", "change", "pivot_dist", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].copy()
+    df_display.columns = ["TICKER", "NAME", "PRICE", "TODAY %", "PIVOT DIST %", "RS", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
     
     df_display.insert(0, "STARRED", df_display["TICKER"].apply(lambda x: x in st.session_state.watchlist))
     df_display.insert(1, "CHART", False)
@@ -410,13 +428,14 @@ def main():
     df_display = df_display.sort_values(by="RS", ascending=False).reset_index(drop=True)
 
     editor_key = "watchlist_editor"
-    disabled_cols = ["TICKER", "NAME", "PRICE", "TODAY %", "RS", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
+    disabled_cols = ["TICKER", "NAME", "PRICE", "TODAY %", "PIVOT DIST %", "RS", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
     
     event = st.data_editor(
         df_display,
         column_config={
             "STARRED": st.column_config.CheckboxColumn("STARRED", help="Add to Watchlist", default=False),
-            "CHART": st.column_config.CheckboxColumn("CHART", help="Send to TV Chart", default=False)
+            "CHART": st.column_config.CheckboxColumn("CHART", help="Send to TV Chart", default=False),
+            "PIVOT DIST %": st.column_config.NumberColumn("PIVOT DIST %", format="%.1f%%")
         },
         disabled=disabled_cols,
         use_container_width=True, 
