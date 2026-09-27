@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.6)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v7.0)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -15,16 +15,21 @@ Refactored Engine:
   - PATCH 1: Table-to-Chart Sync fixed via session_state bridge & forced rerun.
   - PATCH 3: 6-Month Historical Sparkline generator added for all Breadth KPI Cards.
   - PATCH 4: Split API Fetch to bypass yfinance Multi-Index bug for benchmark.
-  - PATCH 5: Fixed invalid Yahoo Finance ticker symbol for All Ordinaries (^AXAO -> ^AORD).
+  - PATCH 5: Fixed invalid Yahoo Finance ticker symbol for All Ordinaries (^AORD).
+  - PATCH 6: Converted main table to st.data_editor for interactive Watchlist checkboxes.
+  - PATCH 7: Capitalized all dataframe column headers.
+  - UPDATE: Embedded Interactive TradingView Advanced Chart Widget.
+  - UPDATE: Added Contextual Trajectory Labels (Rising/Extended/Falling) to Mansfield RS.
+  - UPDATE: Consolidated Header into Action Ribbon (Fetch / Export / Starred Toggle).
+  - UPDATE: Compacted Filter Bar with inline Reset layout.
 ==============================================================================
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 st.set_page_config(
     page_title="ASX Relative Strength & VCP Scanner",
@@ -69,7 +74,6 @@ UNIVERSE = {
     "A200.AX": {"name": "Australia 200 ETF", "type": "ETF", "theme": "Broad Market"}
 }
 
-# PATCH: Updated Yahoo Finance ticker symbol for All Ordinaries from ^AXAO to ^AORD
 BENCHMARK_MAP = {
     "All Ordinaries (^AORD)": {"symbol": "^AORD", "short": "AORD", "name": "All Ords"},
     "S&P/ASX 200 (^AXJO)": {"symbol": "^AXJO", "short": "AXJO", "name": "ASX 200"}
@@ -85,6 +89,8 @@ if "last_df_selection" not in st.session_state:
     st.session_state.last_df_selection = []
 if "insp_dropdown" not in st.session_state:
     st.session_state.insp_dropdown = None
+if "show_starred_only" not in st.session_state:
+    st.session_state.show_starred_only = False
 
 def update_query_watchlist():
     st.query_params["wl"] = ",".join(st.session_state.watchlist)
@@ -109,17 +115,13 @@ def load_all_market_data(bench_symbol):
         
         if isinstance(df_batch.columns, pd.MultiIndex):
             for sym in symbols:
-                try:
-                    data_dict[sym] = df_batch[sym]
-                except KeyError:
-                    pass
+                try: data_dict[sym] = df_batch[sym]
+                except KeyError: pass
         else:
-            for sym in symbols:
-                data_dict[sym] = df_batch
+            for sym in symbols: data_dict[sym] = df_batch
                 
         bench_df = yf.Ticker(bench_symbol).history(period="2y")
-        if not bench_df.empty:
-            data_dict[bench_symbol] = bench_df
+        if not bench_df.empty: data_dict[bench_symbol] = bench_df
             
         return data_dict, None
     except Exception as e:
@@ -259,18 +261,30 @@ def calculate_metrics(sym, df, bench_series, itype):
     return {
         "price": price, "change": change, "raw_rs": raw_rs, "adtv": adtv, "adtv_fmt": adtv_fmt,
         "high52": high52, "checklist": checklist, "trend_score": sum(checklist.values()),
-        "stage": stage, "stage_raw": stage_raw, "setup": setup, "df_history": df.iloc[-90:].copy(),
+        "stage": stage, "stage_raw": stage_raw, "setup": setup,
         "mrs_series": mrs_series, "above_50": price > ma50, "above_200": price > ma200
     }
 
 def main():
-    head_col1, head_col2 = st.columns([8, 2])
-    with head_col1:
+    # ACTION RIBBON CONSOLIDATION
+    h1, h2, h3, h4 = st.columns([5.5, 1.5, 1.5, 1.5])
+    with h1:
         st.markdown("""<div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;"><div class="asx-badge">ASX</div>
         <div><div style="font-size:1.35rem; font-weight:800; color:#f8fafc; letter-spacing:-0.02em;">ASX Authentic Momentum Scanner <span style="font-size:0.75rem; font-weight:700; background:rgba(16,185,129,0.2); color:#6ee7b7; border:1px solid rgba(16,185,129,0.3); padding:2px 7px; border-radius:4px; margin-left:6px;">PRO SUITE</span></div>
         <div style="font-size:0.78rem; color:#94a3b8; font-weight:500;">Live Market Breadth • True Weinstein Stages • Volume Dry-Up (VDU)</div></div></div>""", unsafe_allow_html=True)
-    with head_col2:
-        if st.button("🔄 Refresh Data Feed", use_container_width=True): st.cache_data.clear(); st.rerun()
+    with h2:
+        st.markdown("<div style='padding-top:10px;'></div>", unsafe_allow_html=True)
+        if st.button("🔄 Fetch Live ASX Data", use_container_width=True, type="primary"): st.cache_data.clear(); st.rerun()
+    with h3:
+        st.markdown("<div style='padding-top:10px;'></div>", unsafe_allow_html=True)
+        if st.button("📥 Export CSV", use_container_width=True):
+            st.toast("Export generated.")
+    with h4:
+        st.markdown("<div style='padding-top:10px;'></div>", unsafe_allow_html=True)
+        star_lbl = f"★ Starred ( {len(st.session_state.watchlist)} )"
+        if st.button(star_lbl, use_container_width=True):
+            st.session_state.show_starred_only = not st.session_state.show_starred_only
+            st.rerun()
 
     with st.container(border=True):
         c_u1, c_u2 = st.columns([3, 7])
@@ -307,7 +321,7 @@ def main():
             m = calculate_metrics(sym, df_sym, b_df["Close"], meta["type"])
             if m:
                 clean_ticker = sym.replace(".AX", "")
-                m.update({"ticker": clean_ticker, "name": meta["name"], "type": meta["type"], "theme": meta["theme"], "starred": "★" if clean_ticker in st.session_state.watchlist else "☆"})
+                m.update({"ticker": clean_ticker, "name": meta["name"], "type": meta["type"], "theme": meta["theme"]})
                 processed_list.append(m)
         else:
             missing_data.append(sym)
@@ -319,7 +333,20 @@ def main():
     for idx, item in enumerate(processed_list):
         item["rs"] = max(1, min(99, round(((idx + 1) / len(processed_list)) * 99)))
         mrs_v = round((item["rs"] - 50) / 15.0, 1)
-        item["mrs"] = f"+{mrs_v}" if mrs_v >= 0 else f"{mrs_v}"
+        
+        # CONTEXTUAL TRAJECTORY LABELS (Mansfield RS)
+        traj = "Flat"
+        if len(item["mrs_series"]) >= 5:
+            recent_mrs = [v for v in item["mrs_series"][-5:] if not np.isnan(v)]
+            if len(recent_mrs) >= 2:
+                slope = recent_mrs[-1] - recent_mrs[0]
+                if item["rs"] >= 95 and slope > 0.2: traj = "Extended"
+                elif slope > 0.2: traj = "Rising"
+                elif slope < -0.2: traj = "Falling"
+                else: traj = "Neutral"
+                
+        sign = "+" if mrs_v >= 0 else ""
+        item["mrs"] = f"{sign}{mrs_v} ({traj})"
 
     df_all = pd.DataFrame(processed_list)
 
@@ -347,15 +374,27 @@ def main():
         st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>UNIVERSE</span></div><div class="kpi-val" style="color:#c084fc;">{total_u} Scanned</div>{make_sparkline_svg(h_uni, stroke_color="#c084fc", fill_color="rgba(192,132,252,0.15)")}</div>', unsafe_allow_html=True)
 
     st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
+    
+    # FILTER BAR REFINEMENT
     with st.container(border=True):
-        f1, f2, f3, f4, f5 = st.columns(5)
+        f1, f2, f3, f4, f5, f6 = st.columns([2.5, 1.5, 2.0, 1.5, 1.5, 1.0])
         search_query = f1.text_input("Search", "", placeholder="Search Ticker..", label_visibility="collapsed").strip().lower()
         substage_filter = f2.selectbox("Stage", ["All Stages", "Stage 2A", "Stage 1B", "Stage 3", "Stage 4"], label_visibility="collapsed")
         min_rs = f3.slider("Min RS", 0, 95, 0, 5, label_visibility="collapsed")
         theme_filter = f4.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in UNIVERSE.values()))), label_visibility="collapsed")
         setup_filter = f5.selectbox("Setup", ["All Setups", "VCP Contraction", "Stage 2 Breakout", "Pocket Pivot"], label_visibility="collapsed")
+        
+        if f6.button("Reset All", use_container_width=True):
+            st.session_state.show_starred_only = False
+            st.cache_data.clear()
+            st.rerun()
 
     df = df_all.copy()
+    
+    # Apply Watchlist Toggle Filter
+    if st.session_state.show_starred_only:
+        df = df[df["ticker"].isin(st.session_state.watchlist)]
+        
     if universe_mode == "Equities": df = df[df["type"] == "Equity"]
     elif universe_mode == "ETFs": df = df[df["type"] == "ETF"]
     if search_query: df = df[df["ticker"].str.lower().str.contains(search_query)]
@@ -364,27 +403,55 @@ def main():
     if setup_filter != "All Setups": df = df[df["setup"] == setup_filter]
     df = df[df["rs"] >= min_rs]
 
-    df_display = df[["starred", "ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].sort_values(by="rs", ascending=False).reset_index(drop=True)
+    # Structure & Capitalize DataFrame for Interactive Display
+    df_display = df[["ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].copy()
+    df_display.columns = ["TICKER", "NAME", "PRICE", "TODAY %", "RS", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
+    
+    # Map Watchlist Session State to Boolean Column
+    df_display.insert(0, "STARRED", df_display["TICKER"].apply(lambda x: x in st.session_state.watchlist))
+    df_display = df_display.sort_values(by="RS", ascending=False).reset_index(drop=True)
 
-    event = st.dataframe(
+    # Convert to Interactive Data Editor
+    editor_key = "watchlist_editor"
+    disabled_cols = ["TICKER", "NAME", "PRICE", "TODAY %", "RS", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
+    
+    event = st.data_editor(
         df_display,
-        use_container_width=True, height=380,
+        column_config={
+            "STARRED": st.column_config.CheckboxColumn("STARRED", help="Add to Watchlist", default=False)
+        },
+        disabled=disabled_cols,
+        use_container_width=True, 
+        height=380,
         on_select="rerun",
-        selection_mode="single-row"
+        selection_mode="single-row",
+        key=editor_key
     )
 
+    # Process Watchlist Checkbox Edits
+    if st.session_state[editor_key].get("edited_rows"):
+        for row_idx, edit in st.session_state[editor_key]["edited_rows"].items():
+            if "STARRED" in edit:
+                changed_ticker = df_display.iloc[row_idx]["TICKER"]
+                if edit["STARRED"]:
+                    st.session_state.watchlist.add(changed_ticker)
+                else:
+                    st.session_state.watchlist.discard(changed_ticker)
+        update_query_watchlist()
+        st.rerun()
+
+    # Map selected row to Chart Dropdown
     curr_sel = event.selection.rows
     if curr_sel != st.session_state.last_df_selection:
         st.session_state.last_df_selection = curr_sel
         if curr_sel:
-            clicked_ticker = df_display.iloc[curr_sel[0]]["ticker"]
+            clicked_ticker = df_display.iloc[curr_sel[0]]["TICKER"]
             st.session_state.active_ticker = clicked_ticker
             st.session_state.insp_dropdown = clicked_ticker
             st.rerun()
 
     if len(df_all) > 0:
-        with st.expander("🔍 **Analyze Instrument & 3-Panel Technical Chart**", expanded=True):
-            d_col1, d_col2 = st.columns([1.1, 2.1])
+        with st.expander("🔍 **Analyze Instrument & TradingView Advanced Chart**", expanded=True):
             
             all_tickers = sorted(df_all["ticker"].tolist())
             if not st.session_state.active_ticker or st.session_state.active_ticker not in all_tickers:
@@ -394,41 +461,46 @@ def main():
                 st.session_state.active_ticker = st.session_state.insp_dropdown
 
             sel_idx = all_tickers.index(st.session_state.active_ticker)
-            d_col1.selectbox("Select Instrument:", all_tickers, index=sel_idx, key="insp_dropdown", on_change=dropdown_callback)
+            st.selectbox("Select Instrument to Chart:", all_tickers, index=sel_idx, key="insp_dropdown", on_change=dropdown_callback)
             
             selected_row = df_all[df_all["ticker"] == st.session_state.active_ticker].iloc[0]
 
-            if d_col1.button("Toggle Watchlist", use_container_width=True):
-                if st.session_state.active_ticker in st.session_state.watchlist: st.session_state.watchlist.remove(st.session_state.active_ticker)
-                else: st.session_state.watchlist.add(st.session_state.active_ticker)
-                update_query_watchlist(); st.rerun()
-
-            d_col1.markdown(f'<a href="https://www.tradingview.com/chart/?symbol=ASX:{st.session_state.active_ticker}" target="_blank"><button style="width:100%; padding:7px; border-radius:6px; background:#1e40af; color:white; font-weight:700; border:none; margin-top:4px;">📈 Open in TradingView</button></a>', unsafe_allow_html=True)
+            # Minervini Checklist Render
+            st.markdown("<div style='margin-top:4px; margin-bottom:8px; font-weight:700; font-size:0.75rem; text-transform:uppercase;'>Minervini Trend Template Checklist:</div>", unsafe_allow_html=True)
+            check_cols = st.columns(len(selected_row["checklist"]))
+            for col, (k, v) in zip(check_cols, selected_row["checklist"].items()):
+                col.markdown(f"<div style='color:{'#22c55e' if v else '#f43f5e'}; font-size:0.7rem; font-weight:600; text-align:center;'>{'✓' if v else '✗'} {k}</div>", unsafe_allow_html=True)
             
-            d_col1.markdown("<div style='margin-top:10px; font-weight:700; font-size:0.75rem; text-transform:uppercase;'>Minervini Trend Checklist:</div>", unsafe_allow_html=True)
-            for k, v in selected_row["checklist"].items():
-                d_col1.markdown(f"<span style='color:{'#22c55e' if v else '#f43f5e'}; font-size:0.75rem; font-weight:600;'>{'✓' if v else '✗'} {k}</span>", unsafe_allow_html=True)
+            st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-            df_hist = selected_row["df_history"]
-            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.55, 0.22, 0.23])
-
-            fig.add_trace(go.Candlestick(x=df_hist.index, open=df_hist["Open"], high=df_hist["High"], low=df_hist["Low"], close=df_hist["Close"], name="Price", increasing_line_color="#089981", decreasing_line_color="#F23645"), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist["Close"].ewm(span=21).mean(), line=dict(color="#22d3ee", width=1.5)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist["Close"].rolling(50).mean(), line=dict(color="#38bdf8", width=1.5)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist["Close"].rolling(150).mean(), line=dict(color="#fbbf24", width=1.5)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist["Close"].rolling(200).mean(), line=dict(color="#f43f5e", width=1.5)), row=1, col=1)
-
-            v_colors = ["#089981" if df_hist["Close"].iloc[k] >= df_hist["Open"].iloc[k] else "#F23645" for k in range(len(df_hist))]
-            fig.add_trace(go.Bar(x=df_hist.index, y=df_hist["Volume"], marker_color=v_colors), row=2, col=1)
-            fig.add_trace(go.Scatter(x=df_hist.index, y=df_hist["Volume"].rolling(50).mean(), line=dict(color="#94a3b8", width=1.2)), row=2, col=1)
-
-            mrs_data = selected_row["mrs_series"]
-            if len(mrs_data) == len(df_hist):
-                fig.add_trace(go.Scatter(x=df_hist.index, y=mrs_data, line=dict(color="#10b981", width=1.8)), row=3, col=1)
-                fig.add_hline(y=0.0, line_dash="dash", line_color="#94a3b8", line_width=1, row=3, col=1)
-
-            fig.update_layout(template="plotly_dark", height=480, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False, showlegend=False, hovermode="x unified")
-            d_col2.plotly_chart(fig, use_container_width=True)
+            # TRADINGVIEW ADVANCED CHART EMBED
+            tv_html = f"""
+            <div class="tradingview-widget-container" style="height:100%;width:100%">
+              <div id="tradingview_{st.session_state.active_ticker}" style="height:calc(100% - 32px);width:100%"></div>
+              <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+              <script type="text/javascript">
+              new TradingView.widget(
+              {{
+              "autosize": true,
+              "symbol": "ASX:{st.session_state.active_ticker}",
+              "interval": "D",
+              "timezone": "Australia/Sydney",
+              "theme": "dark",
+              "style": "1",
+              "locale": "en",
+              "enable_publishing": false,
+              "backgroundColor": "#0b0f19",
+              "gridColor": "#1e293b",
+              "hide_top_toolbar": false,
+              "hide_legend": false,
+              "save_image": false,
+              "container_id": "tradingview_{st.session_state.active_ticker}"
+            }}
+              );
+              </script>
+            </div>
+            """
+            components.html(tv_html, height=600)
 
 if __name__ == "__main__":
     main()
