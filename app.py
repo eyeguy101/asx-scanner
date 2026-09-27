@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.5)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.6)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -14,7 +14,8 @@ Refactored Engine:
   - Phase 4: Added .ffill() to raw data to prevent Yahoo NaNs from excluding stocks.
   - PATCH 1: Table-to-Chart Sync fixed via session_state bridge & forced rerun.
   - PATCH 3: 6-Month Historical Sparkline generator added for all Breadth KPI Cards.
-  - PATCH 4: Split API Fetch to bypass yfinance Multi-Index bug for ^AXAO benchmark.
+  - PATCH 4: Split API Fetch to bypass yfinance Multi-Index bug for benchmark.
+  - PATCH 5: Fixed invalid Yahoo Finance ticker symbol for All Ordinaries (^AXAO -> ^AORD).
 ==============================================================================
 """
 
@@ -68,8 +69,9 @@ UNIVERSE = {
     "A200.AX": {"name": "Australia 200 ETF", "type": "ETF", "theme": "Broad Market"}
 }
 
+# PATCH: Updated Yahoo Finance ticker symbol for All Ordinaries from ^AXAO to ^AORD
 BENCHMARK_MAP = {
-    "All Ordinaries (^AXAO)": {"symbol": "^AXAO", "short": "AXAO", "name": "All Ords"},
+    "All Ordinaries (^AORD)": {"symbol": "^AORD", "short": "AORD", "name": "All Ords"},
     "S&P/ASX 200 (^AXJO)": {"symbol": "^AXJO", "short": "AXJO", "name": "ASX 200"}
 }
 
@@ -102,7 +104,6 @@ def make_sparkline_svg(values, stroke_color="#22c55e", fill_color="rgba(34, 197,
 def load_all_market_data(bench_symbol):
     symbols = list(set(UNIVERSE.keys()))
     try:
-        # 1. Fetch Equities as a bulk batch
         df_batch = yf.download(symbols, period="2y", interval="1d", progress=False, group_by="ticker")
         data_dict = {}
         
@@ -116,7 +117,6 @@ def load_all_market_data(bench_symbol):
             for sym in symbols:
                 data_dict[sym] = df_batch
                 
-        # 2. Fetch Benchmark completely independently to bypass yfinance MultiIndex wipeout bug
         bench_df = yf.Ticker(bench_symbol).history(period="2y")
         if not bench_df.empty:
             data_dict[bench_symbol] = bench_df
@@ -126,7 +126,6 @@ def load_all_market_data(bench_symbol):
         return None, str(e)
 
 def get_historical_breadth(raw_data, universe_keys, b_df_index):
-    """Calculates 6-month historical breadth data for sparkline charts."""
     target_idx = b_df_index[-125:]
     count_50 = pd.Series(0, index=target_idx)
     count_200 = pd.Series(0, index=target_idx)
@@ -282,7 +281,6 @@ def main():
     raw_data, err = load_all_market_data(bench_info["symbol"])
     if err or raw_data is None: st.error(f"Market feed error: {err}"); return
 
-    # Extract benchmark safely
     b_df = None
     if bench_info["symbol"] in raw_data:
         b_df = raw_data[bench_info["symbol"]].ffill().dropna(subset=["Close"])
@@ -291,7 +289,6 @@ def main():
         st.error(f"Failed to fetch sufficient benchmark data for {bench_info['symbol']}. Halting scan to prevent false regime data.")
         return
 
-    # Info Banner
     b_df.index = pd.to_datetime(b_df.index).tz_localize(None)
     last_valid_date = b_df.index[-1].strftime('%d %b %Y')
     st.info(f"💡 **Benchmark Data Note:** {bench_info['name']} ({bench_info['symbol']}) is utilizing the last valid closing data from **{last_valid_date}**.")
