@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.4)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v6.5)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -11,11 +11,10 @@ Refactored Engine:
   - Phase 4: Timezone-stripped DatetimeIndex for safe resampling.
   - Phase 4: `auto_adjust` removed to prevent yfinance deprecation errors.
   - Phase 4: `fillna(method='ffill')` patched to `ffill()` to resolve Pandas TypeError.
-  - Phase 4: Fixed StreamlitValueError by changing "single_row" to "single-row".
   - Phase 4: Added .ffill() to raw data to prevent Yahoo NaNs from excluding stocks.
   - PATCH 1: Table-to-Chart Sync fixed via session_state bridge & forced rerun.
-  - PATCH 2: AXAO Benchmark fallback removed, ffill() applied with Date Warning Banner.
   - PATCH 3: 6-Month Historical Sparkline generator added for all Breadth KPI Cards.
+  - PATCH 4: Split API Fetch to bypass yfinance Multi-Index bug for ^AXAO benchmark.
 ==============================================================================
 """
 
@@ -101,17 +100,34 @@ def make_sparkline_svg(values, stroke_color="#22c55e", fill_color="rgba(34, 197,
 
 @st.cache_data(ttl=3600)
 def load_all_market_data(bench_symbol):
-    symbols = list(set(list(UNIVERSE.keys()) + [bench_symbol]))
+    symbols = list(set(UNIVERSE.keys()))
     try:
-        data = yf.download(symbols, period="2y", interval="1d", progress=False, group_by="ticker")
-        return data, None
+        # 1. Fetch Equities as a bulk batch
+        df_batch = yf.download(symbols, period="2y", interval="1d", progress=False, group_by="ticker")
+        data_dict = {}
+        
+        if isinstance(df_batch.columns, pd.MultiIndex):
+            for sym in symbols:
+                try:
+                    data_dict[sym] = df_batch[sym]
+                except KeyError:
+                    pass
+        else:
+            for sym in symbols:
+                data_dict[sym] = df_batch
+                
+        # 2. Fetch Benchmark completely independently to bypass yfinance MultiIndex wipeout bug
+        bench_df = yf.Ticker(bench_symbol).history(period="2y")
+        if not bench_df.empty:
+            data_dict[bench_symbol] = bench_df
+            
+        return data_dict, None
     except Exception as e:
         return None, str(e)
 
 def get_historical_breadth(raw_data, universe_keys, b_df_index):
     """Calculates 6-month historical breadth data for sparkline charts."""
-    target_idx = b_df_index[-125:] # Approx 6 months of trading days
-    
+    target_idx = b_df_index[-125:]
     count_50 = pd.Series(0, index=target_idx)
     count_200 = pd.Series(0, index=target_idx)
     count_2a = pd.Series(0, index=target_idx)
@@ -130,7 +146,6 @@ def get_historical_breadth(raw_data, universe_keys, b_df_index):
         ma50 = close.rolling(50).mean()
         ma200 = close.rolling(200).mean()
         
-        # Fast Weekly 30-MA mapping
         df_weekly = close.resample('W-FRI').last()
         w_ma30 = df_weekly.rolling(30).mean()
         w_slope = (w_ma30 - w_ma30.shift(4)) / w_ma30
@@ -142,14 +157,12 @@ def get_historical_breadth(raw_data, universe_keys, b_df_index):
         is_2a = ((close >= w_ma30_d * 0.98) & (w_slope_d >= -0.005) & ((high52 - close) / high52 <= 0.08))
         is_3 = ((close < w_ma30_d) & (w_slope_d > -0.01) & ((high52 - close) / high52 < 0.15))
         
-        # Align booleans to target index and sum
         count_50 += (close > ma50).astype(int).reindex(target_idx).fillna(0)
         count_200 += (close > ma200).astype(int).reindex(target_idx).fillna(0)
         count_2a += is_2a.astype(int).reindex(target_idx).fillna(0)
         count_3 += is_3.astype(int).reindex(target_idx).fillna(0)
         count_uni += close.notna().astype(int).reindex(target_idx).fillna(0)
 
-    # Protect against div zero
     safe_uni = count_uni.replace(0, 1)
     pct_50 = (count_50 / safe_uni * 100).tolist()
     pct_200 = (count_200 / safe_uni * 100).tolist()
@@ -269,7 +282,7 @@ def main():
     raw_data, err = load_all_market_data(bench_info["symbol"])
     if err or raw_data is None: st.error(f"Market feed error: {err}"); return
 
-    # Robust Benchmark Extraction & Date Warning Info Banner
+    # Extract benchmark safely
     b_df = None
     if bench_info["symbol"] in raw_data:
         b_df = raw_data[bench_info["symbol"]].ffill().dropna(subset=["Close"])
@@ -278,7 +291,7 @@ def main():
         st.error(f"Failed to fetch sufficient benchmark data for {bench_info['symbol']}. Halting scan to prevent false regime data.")
         return
 
-    # Extract date of last valid point and print subtle warning info
+    # Info Banner
     b_df.index = pd.to_datetime(b_df.index).tz_localize(None)
     last_valid_date = b_df.index[-1].strftime('%d %b %Y')
     st.info(f"💡 **Benchmark Data Note:** {bench_info['name']} ({bench_info['symbol']}) is utilizing the last valid closing data from **{last_valid_date}**.")
@@ -313,7 +326,6 @@ def main():
 
     df_all = pd.DataFrame(processed_list)
 
-    # Fetch 6-Month Historical Data Arrays for Sparklines
     h_50, h_200, h_2a, h_3, h_uni = get_historical_breadth(raw_data, UNIVERSE.keys(), b_df.index)
 
     total_u = len(df_all)
@@ -355,10 +367,8 @@ def main():
     if setup_filter != "All Setups": df = df[df["setup"] == setup_filter]
     df = df[df["rs"] >= min_rs]
 
-    # Structure DataFrame for Display & Selection Map
     df_display = df[["starred", "ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].sort_values(by="rs", ascending=False).reset_index(drop=True)
 
-    # Interactive Clickable Dataframe
     event = st.dataframe(
         df_display,
         use_container_width=True, height=380,
@@ -366,7 +376,6 @@ def main():
         selection_mode="single-row"
     )
 
-    # Force chart sync via Session State bridge when table row is clicked
     curr_sel = event.selection.rows
     if curr_sel != st.session_state.last_df_selection:
         st.session_state.last_df_selection = curr_sel
