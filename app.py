@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v8.1)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v9.0)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -9,15 +9,16 @@ Refactored Engine:
   - Phase 1: VCP logic based on actual price contraction and volume dry-up.
   - Phase 2: Live rolling market breadth (no synthetic data).
   - Phase 4: Timezone-stripped DatetimeIndex for safe resampling.
-  - Phase 4: `auto_adjust` removed to prevent yfinance deprecation errors.
+  - Phase 4: Added .ffill() to raw data to prevent Yahoo NaNs from excluding stocks.
   - PATCH 4: Split API Fetch to bypass yfinance Multi-Index bug for benchmark.
   - PATCH 8: Resolved st.data_editor TypeError with interactive CHART action column.
   - PATCH 10: Fixed TradingView Widget vertical compression.
-  - UPDATE: Embedded Interactive TradingView Advanced Chart Widget.
-  - UPDATE: Consolidated Header into Action Ribbon.
-  - NEW: Dynamic Universe Integration (Live ASX Directory Scraping via Markit API).
-  - NEW: Distance to Pivot (%) calculation added to identify tight base breakouts.
-  - PATCH 11: Added ZeroDivisionError safeguards for defunct stocks in the full market feed.
+  - PATCH 11: Added ZeroDivisionError safeguards for defunct stocks.
+  - UPDATE: Dynamic Universe Integration (Live ASX Directory Scraping via Markit API).
+  - UPDATE: Distance to Pivot (%) calculation added to identify tight base breakouts.
+  - NEW/FIX: Hardened Weinstein Stage logic based on 30w MA smoothed slopes.
+  - NEW/FIX: Enforced Minervini Trend Template prerequisites for all VCP setups.
+  - NEW/FIX: Added base depth and positional constraints to block falling knife false positives.
 ==============================================================================
 """
 
@@ -183,7 +184,6 @@ def calculate_metrics(sym, df, bench_series, itype):
     n = len(close)
 
     price = float(close.iloc[-1])
-    # Prevent divide by zero on daily change
     prev_price = float(close.iloc[-2]) if n >= 2 else price
     change = ((price - prev_price) / prev_price) * 100.0 if prev_price > 0.0 else 0.0
 
@@ -194,6 +194,7 @@ def calculate_metrics(sym, df, bench_series, itype):
     
     df_weekly = df.resample('W-FRI').last().dropna(subset=["Close"])
     weekly_ma30 = float(df_weekly["Close"].rolling(30).mean().iloc[-1]) if len(df_weekly) >= 30 else ma150
+    # Smoothed slope to prevent false stage transitions on whipsaws
     weekly_slope = (weekly_ma30 - float(df_weekly["Close"].rolling(30).mean().iloc[-4])) / weekly_ma30 if len(df_weekly) >= 34 else 0.0
 
     high52 = float(high.iloc[-min(n, 252):].max())
@@ -215,7 +216,9 @@ def calculate_metrics(sym, df, bench_series, itype):
         "Price Within 25% of 52W High": price >= (high52 * 0.75)
     }
 
-    # Safe Return Calculation to prevent ZeroDivisionError on defunct market listings
+    # TT STRICT PASS: Must satisfy structural moving average bounds to qualify for VCP/Breakouts
+    tt_pass = checklist["Price > 150 & 200 MA"] and checklist["Price > 50 MA"]
+
     def get_ret(d_start, d_end):
         if n <= d_start: return 0.0
         p_start = float(close.iloc[-d_start])
@@ -234,31 +237,61 @@ def calculate_metrics(sym, df, bench_series, itype):
     adtv = avg_vol20 * price
     adtv_fmt = f"${adtv/1e6:.1f}M" if adtv >= 1e6 else f"${round(adtv/1e3)}k"
 
-    if price >= weekly_ma30 * 0.98:
-        if weekly_slope >= -0.005:
-            if (high52 - price) / high52 <= 0.08: stage, stage_raw = "Stage 2A (Early Markup)", "2A"
-            elif (price - weekly_ma30) / weekly_ma30 >= 0.25: stage, stage_raw = "Stage 2B (Late Uptrend)", "2B"
-            else: stage, stage_raw = "Stage 2 (Advancing)", "2"
+    # ==========================================
+    # HARDENED WEINSTEIN STAGE LOGIC
+    # ==========================================
+    stage_raw = "1"
+    stage = "Stage 1 (Basing)"
+    
+    # ADVANCING PHASE: Tangibly rising 30w MA
+    if price >= weekly_ma30 * 0.98 and weekly_slope > 0.002: 
+        if (price - weekly_ma30) / weekly_ma30 > 0.25:
+            stage, stage_raw = "Stage 2B (Late Uptrend)", "2B"
+        elif (high52 - price) / high52 <= 0.15:
+            stage, stage_raw = "Stage 2A (Early Markup)", "2A"
         else:
-            stage, stage_raw = "Stage 1B (Late Base / Coiling)", "1B"
-    elif price < weekly_ma30:
-        if weekly_slope > -0.01 and rvol > 1.2 and (high52 - price)/high52 < 0.15:
+            stage, stage_raw = "Stage 2 (Advancing)", "2"
+            
+    # DECLINING PHASE: Tangibly declining 30w MA, price below it
+    elif price < weekly_ma30 * 0.98 and weekly_slope < -0.002:
+        stage, stage_raw = "Stage 4 (Downtrend)", "4"
+        
+    # TRANSITIONAL FUZZINESS (Flattening MA)
+    elif weekly_slope <= 0.002 and weekly_slope >= -0.005:
+        if (high52 - price) / high52 < 0.20 and price < weekly_ma30 * 1.05 and price > weekly_ma30 * 0.85:
+            # Whipsawing near highs, losing upside momentum
             stage, stage_raw = "Stage 3 (Distribution)", "3"
-        elif weekly_slope < -0.01:
-            stage, stage_raw = "Stage 4 (Downtrend)", "4"
         else:
+            # Flattening out low in the chart
             stage, stage_raw = "Stage 1 (Basing)", "1"
-    else:
-        stage, stage_raw = "Stage 1 (Basing)", "1"
 
-    range_5d = float(high.iloc[-5:].max() - low.iloc[-5:].min()) if n >= 5 else 0
-    range_20d = float(high.iloc[-20:].max() - low.iloc[-20:].min()) if n >= 20 else 0
+    # ==========================================
+    # HARDENED MINERVINI SETUP LOGIC
+    # ==========================================
+    max_20d = float(high.iloc[-20:].max()) if n >= 20 else price
+    min_20d = float(low.iloc[-20:].min()) if n >= 20 else price
+    range_20d_pct = (max_20d - min_20d) / min_20d if min_20d > 0 else 0
+    
+    max_5d = float(high.iloc[-5:].max()) if n >= 5 else price
+    min_5d = float(low.iloc[-5:].min()) if n >= 5 else price
+    range_5d_pct = (max_5d - min_5d) / min_5d if min_5d > 0 else 0
+    
+    position_20d = (price - min_20d) / (max_20d - min_20d) if max_20d > min_20d else 0
     vdu = curr_vol < (avg_vol50 * 0.5)
 
-    if stage_raw in ["2A", "2"] and range_5d < (range_20d * 0.5) and vdu: setup = "VCP Contraction"
-    elif stage_raw in ["2A", "1B"] and rvol >= 1.5 and change > 2.0: setup = "Stage 2 Breakout"
-    elif price > ma50 and rvol >= 1.5 and change > 0: setup = "Pocket Pivot"
-    else: setup = "Trend Continuation"
+    setup = "Trend Continuation"
+    
+    # Must be structurally sound (Trend Template + Stage 2) to trigger constructive setups
+    if tt_pass and stage_raw in ["2A", "2"]:
+        # VCP: Max depth 25%, Tightness < 6%, closing in upper half, dry volume
+        if range_20d_pct <= 0.25 and range_5d_pct <= 0.06 and position_20d > 0.5 and vdu:
+            setup = "VCP Contraction"
+        # Breakout: Pushing top 10% of base, big volume, strong move
+        elif position_20d > 0.90 and rvol >= 1.5 and change > 2.0:
+            setup = "Stage 2 Breakout"
+        # Pocket Pivot: Surging inside the base on heavy volume
+        elif price > ma50 and rvol >= 1.5 and change > 0 and position_20d > 0.3:
+            setup = "Pocket Pivot"
 
     mrs_series = []
     if bench_series is not None:
