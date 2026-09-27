@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v7.0)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v7.1)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -12,7 +12,6 @@ Refactored Engine:
   - Phase 4: `auto_adjust` removed to prevent yfinance deprecation errors.
   - Phase 4: `fillna(method='ffill')` patched to `ffill()` to resolve Pandas TypeError.
   - Phase 4: Added .ffill() to raw data to prevent Yahoo NaNs from excluding stocks.
-  - PATCH 1: Table-to-Chart Sync fixed via session_state bridge & forced rerun.
   - PATCH 3: 6-Month Historical Sparkline generator added for all Breadth KPI Cards.
   - PATCH 4: Split API Fetch to bypass yfinance Multi-Index bug for benchmark.
   - PATCH 5: Fixed invalid Yahoo Finance ticker symbol for All Ordinaries (^AORD).
@@ -22,6 +21,7 @@ Refactored Engine:
   - UPDATE: Added Contextual Trajectory Labels (Rising/Extended/Falling) to Mansfield RS.
   - UPDATE: Consolidated Header into Action Ribbon (Fetch / Export / Starred Toggle).
   - UPDATE: Compacted Filter Bar with inline Reset layout.
+  - PATCH 8: Resolved st.data_editor TypeError by removing on_select and adding an interactive CHART action column.
 ==============================================================================
 """
 
@@ -85,8 +85,6 @@ if "watchlist" not in st.session_state:
     st.session_state.watchlist = set(query_wl.split(",")) if query_wl else set(["DRO", "SPR", "DYL", "ATOM"])
 if "active_ticker" not in st.session_state:
     st.session_state.active_ticker = None
-if "last_df_selection" not in st.session_state:
-    st.session_state.last_df_selection = []
 if "insp_dropdown" not in st.session_state:
     st.session_state.insp_dropdown = None
 if "show_starred_only" not in st.session_state:
@@ -266,7 +264,6 @@ def calculate_metrics(sym, df, bench_series, itype):
     }
 
 def main():
-    # ACTION RIBBON CONSOLIDATION
     h1, h2, h3, h4 = st.columns([5.5, 1.5, 1.5, 1.5])
     with h1:
         st.markdown("""<div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;"><div class="asx-badge">ASX</div>
@@ -334,7 +331,6 @@ def main():
         item["rs"] = max(1, min(99, round(((idx + 1) / len(processed_list)) * 99)))
         mrs_v = round((item["rs"] - 50) / 15.0, 1)
         
-        # CONTEXTUAL TRAJECTORY LABELS (Mansfield RS)
         traj = "Flat"
         if len(item["mrs_series"]) >= 5:
             recent_mrs = [v for v in item["mrs_series"][-5:] if not np.isnan(v)]
@@ -375,7 +371,6 @@ def main():
 
     st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
     
-    # FILTER BAR REFINEMENT
     with st.container(border=True):
         f1, f2, f3, f4, f5, f6 = st.columns([2.5, 1.5, 2.0, 1.5, 1.5, 1.0])
         search_query = f1.text_input("Search", "", placeholder="Search Ticker..", label_visibility="collapsed").strip().lower()
@@ -391,7 +386,6 @@ def main():
 
     df = df_all.copy()
     
-    # Apply Watchlist Toggle Filter
     if st.session_state.show_starred_only:
         df = df[df["ticker"].isin(st.session_state.watchlist)]
         
@@ -403,33 +397,31 @@ def main():
     if setup_filter != "All Setups": df = df[df["setup"] == setup_filter]
     df = df[df["rs"] >= min_rs]
 
-    # Structure & Capitalize DataFrame for Interactive Display
     df_display = df[["ticker", "name", "price", "change", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].copy()
     df_display.columns = ["TICKER", "NAME", "PRICE", "TODAY %", "RS", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
     
-    # Map Watchlist Session State to Boolean Column
     df_display.insert(0, "STARRED", df_display["TICKER"].apply(lambda x: x in st.session_state.watchlist))
+    df_display.insert(1, "CHART", False)
+    
     df_display = df_display.sort_values(by="RS", ascending=False).reset_index(drop=True)
 
-    # Convert to Interactive Data Editor
     editor_key = "watchlist_editor"
     disabled_cols = ["TICKER", "NAME", "PRICE", "TODAY %", "RS", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
     
     event = st.data_editor(
         df_display,
         column_config={
-            "STARRED": st.column_config.CheckboxColumn("STARRED", help="Add to Watchlist", default=False)
+            "STARRED": st.column_config.CheckboxColumn("STARRED", help="Add to Watchlist", default=False),
+            "CHART": st.column_config.CheckboxColumn("CHART", help="Send to TV Chart", default=False)
         },
         disabled=disabled_cols,
         use_container_width=True, 
         height=380,
-        on_select="rerun",
-        selection_mode="single-row",
         key=editor_key
     )
 
-    # Process Watchlist Checkbox Edits
     if st.session_state[editor_key].get("edited_rows"):
+        rerun_needed = False
         for row_idx, edit in st.session_state[editor_key]["edited_rows"].items():
             if "STARRED" in edit:
                 changed_ticker = df_display.iloc[row_idx]["TICKER"]
@@ -437,17 +429,16 @@ def main():
                     st.session_state.watchlist.add(changed_ticker)
                 else:
                     st.session_state.watchlist.discard(changed_ticker)
-        update_query_watchlist()
-        st.rerun()
-
-    # Map selected row to Chart Dropdown
-    curr_sel = event.selection.rows
-    if curr_sel != st.session_state.last_df_selection:
-        st.session_state.last_df_selection = curr_sel
-        if curr_sel:
-            clicked_ticker = df_display.iloc[curr_sel[0]]["TICKER"]
-            st.session_state.active_ticker = clicked_ticker
-            st.session_state.insp_dropdown = clicked_ticker
+                update_query_watchlist()
+                rerun_needed = True
+                
+            if "CHART" in edit and edit["CHART"]:
+                clicked_ticker = df_display.iloc[row_idx]["TICKER"]
+                st.session_state.active_ticker = clicked_ticker
+                st.session_state.insp_dropdown = clicked_ticker
+                rerun_needed = True
+                
+        if rerun_needed:
             st.rerun()
 
     if len(df_all) > 0:
@@ -465,7 +456,6 @@ def main():
             
             selected_row = df_all[df_all["ticker"] == st.session_state.active_ticker].iloc[0]
 
-            # Minervini Checklist Render
             st.markdown("<div style='margin-top:4px; margin-bottom:8px; font-weight:700; font-size:0.75rem; text-transform:uppercase;'>Minervini Trend Template Checklist:</div>", unsafe_allow_html=True)
             check_cols = st.columns(len(selected_row["checklist"]))
             for col, (k, v) in zip(check_cols, selected_row["checklist"].items()):
@@ -473,7 +463,6 @@ def main():
             
             st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-            # TRADINGVIEW ADVANCED CHART EMBED
             tv_html = f"""
             <div class="tradingview-widget-container" style="height:100%;width:100%">
               <div id="tradingview_{st.session_state.active_ticker}" style="height:calc(100% - 32px);width:100%"></div>
