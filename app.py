@@ -10,6 +10,7 @@ Refactored Engine:
   - Phase 2: Live rolling market breadth (no synthetic data).
   - Phase 4: Timezone-stripped DatetimeIndex for safe resampling.
   - Phase 4: `auto_adjust` removed to prevent yfinance deprecation errors.
+  - Phase 4: `fillna(method='ffill')` patched to `ffill()` to resolve Pandas TypeError.
   - Omitted: 1R Position Sizing and Risk Module.
 ==============================================================================
 """
@@ -193,7 +194,7 @@ def calculate_metrics(sym, df, bench_series, itype):
             ratio = close.loc[common_idx] / bench_series.loc[common_idx]
             ratio_ma = ratio.rolling(52).mean()
             mrs_curve = ((ratio / ratio_ma) - 1.0) * 10.0
-            mrs_series = mrs_curve.reindex(close.index).fillna(method='ffill').iloc[-90:].tolist()
+            mrs_series = mrs_curve.reindex(close.index).ffill().iloc[-90:].tolist()
 
     return {
         "price": price, "change": change, "raw_rs": raw_rs, "adtv": adtv, "adtv_fmt": adtv_fmt,
