@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v7.2)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v7.3)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -23,6 +23,7 @@ Refactored Engine:
   - UPDATE: Compacted Filter Bar with inline Reset layout.
   - PATCH 8: Resolved st.data_editor TypeError by removing on_select and adding an interactive CHART action column.
   - PATCH 9: Fixed data_editor infinite rerun loop by clearing session_state[editor_key].
+  - PATCH 10: Fixed TradingView Widget vertical compression by enforcing hard pixel bounds.
 ==============================================================================
 """
 
@@ -468,8 +469,8 @@ def main():
             st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
             tv_html = f"""
-            <div class="tradingview-widget-container" style="height:100%;width:100%">
-              <div id="tradingview_{st.session_state.active_ticker}" style="height:calc(100% - 32px);width:100%"></div>
+            <div class="tradingview-widget-container" style="height:650px;width:100%">
+              <div id="tradingview_{st.session_state.active_ticker}" style="height:100%;width:100%"></div>
               <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
               <script type="text/javascript">
               new TradingView.widget(
@@ -493,7 +494,7 @@ def main():
               </script>
             </div>
             """
-            components.html(tv_html, height=600)
+            components.html(tv_html, height=650)
 
 if __name__ == "__main__":
     main()
