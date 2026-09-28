@@ -1,24 +1,19 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v10.0)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v11.0)
 ==============================================================================
 Refactored Engine:
-  - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
-  - Phase 1: True Minervini slope calculations (150-day and 200-day).
-  - Phase 1: Discrete quarterly O'Neil RS calculation (non-overlapping).
-  - Phase 1: VCP logic based on actual price contraction and volume dry-up.
+  - Phase 1: Authentic Weinstein Stages & True Minervini slope calculations.
+  - Phase 1: Discrete quarterly O'Neil RS calculation & VCP logic.
   - Phase 2: Live rolling market breadth (no synthetic data).
-  - Phase 4: Timezone-stripped DatetimeIndex for safe resampling.
-  - Phase 4: Added .ffill() to raw data to prevent Yahoo NaNs from excluding stocks.
-  - UPDATE: Dynamic Universe Integration (Live ASX Directory Scraping via Markit API).
-  - UPDATE: Distance to Pivot (%) calculation added to identify tight base breakouts.
-  - UPDATE: Integrated dropdown Price Filter (e.g., > $0.10).
-  - FIX: Hardened contiguous Weinstein Stage boundaries to eliminate "unclassified" gaps.
-  - FIX: Intraday Volume Normalization (pro-rates volume based on AEST time of day).
-  - FIX: True Minervini Continuous MA (200-day MA must rise sequentially, not just point-to-point).
-  - FIX: Dynamic ATR Tightness for VCP (replaces arbitrary 6% rule).
-  - FIX: True Resistance Breakouts (evaluates strictly against prior 20-day highs, excluding today).
-  - FIX: Authentic Pocket Pivots (volume must exceed max down-volume of prior 10 days).
+  - Phase 4: Timezone-stripped DatetimeIndex & Yahoo NaN prevention.
+  - UPDATE: Dynamic Universe Integration & Pivot Distance (%).
+  - UPDATE: Dropdown Price Filter.
+  - UPDATE: Authentic Pocket Pivots, Dynamic VCP ATR, Contiguous Stages.
+  - NEW (v11.0): Average Daily Range (ADR%) and Multi-Timeframe Returns (1M & 3M).
+  - NEW (v11.0): Relative Strength Shift (RS-S) momentum over 1-month lookback.
+  - NEW (v11.0): Macro Dashboard Tab (A/D Line, Breadth Oscillators, Theme Aggregation).
+  - NEW (v11.0): Interactive Plotly Pure RS Line chart below TradingView widget.
 ==============================================================================
 """
 
@@ -28,9 +23,11 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import pytz
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 st.set_page_config(
-    page_title="ASX Relative Strength & VCP Scanner",
+    page_title="ASX Momentum Scanner",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -45,6 +42,9 @@ st.markdown("""
     .kpi-val { font-size: 0.98rem; font-weight: 800; font-family: 'JetBrains Mono', 'Menlo', monospace; }
     .asx-badge { background: linear-gradient(135deg, #10b981 0%, #0d9488 50%, #0284c7 100%); color: white; font-weight: 900; font-size: 0.95rem; padding: 6px 10px; border-radius: 8px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.25); }
     div[data-testid="stRadio"] > label, div[data-testid="stSelectbox"] > label, div[data-testid="stTextInput"] > label, div[data-testid="stSlider"] > label { display: none; }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] { background-color: #1e293b; border-radius: 4px 4px 0 0; padding: 10px 20px; }
+    .stTabs [aria-selected="true"] { background-color: #2563eb !important; color: white !important; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -72,7 +72,6 @@ if "watchlist" not in st.session_state:
     query_wl = st.query_params.get("wl", "")
     st.session_state.watchlist = set(query_wl.split(",")) if query_wl else set(["DRO", "SPR", "DYL"])
 if "active_ticker" not in st.session_state: st.session_state.active_ticker = None
-if "last_df_selection" not in st.session_state: st.session_state.last_df_selection = []
 if "insp_dropdown" not in st.session_state: st.session_state.insp_dropdown = None
 if "show_starred_only" not in st.session_state: st.session_state.show_starred_only = False
 
@@ -86,18 +85,12 @@ def fetch_dynamic_universe():
         df = pd.read_csv(url)
         df = df.dropna(subset=['ASX code'])
         df = df[df['ASX code'].str.match(r'^[A-Z]{3}$')]
-        
         dynamic_universe = {}
         for _, row in df.iterrows():
             sym = f"{row['ASX code']}.AX"
             theme = str(row.get('GICS industry group', 'Unclassified')).title()
             if theme in ["Nan", "Not Applic", "Unclassified"]: theme = "Diversified / Unclassified"
-                
-            dynamic_universe[sym] = {
-                "name": str(row.get('Company name', sym)).title(),
-                "type": "Equity",
-                "theme": theme
-            }
+            dynamic_universe[sym] = {"name": str(row.get('Company name', sym)).title(), "type": "Equity", "theme": theme}
         return dynamic_universe
     except Exception as e:
         return FALLBACK_UNIVERSE
@@ -119,17 +112,14 @@ def load_all_market_data(universe_dict, bench_symbol):
     try:
         df_batch = yf.download(symbols, period="2y", interval="1d", progress=False, group_by="ticker")
         data_dict = {}
-        
         if isinstance(df_batch.columns, pd.MultiIndex):
             for sym in symbols:
                 try: data_dict[sym] = df_batch[sym]
                 except KeyError: pass
         else:
             for sym in symbols: data_dict[sym] = df_batch
-                
         bench_df = yf.Ticker(bench_symbol).history(period="2y")
         if not bench_df.empty: data_dict[bench_symbol] = bench_df
-            
         return data_dict, None
     except Exception as e:
         return None, str(e)
@@ -141,6 +131,7 @@ def get_historical_breadth(raw_data, universe_keys, b_df_index):
     count_2a = pd.Series(0, index=target_idx)
     count_3 = pd.Series(0, index=target_idx)
     count_uni = pd.Series(0, index=target_idx)
+    ad_line = pd.Series(0, index=target_idx)
 
     for sym in universe_keys:
         if sym not in raw_data: continue
@@ -151,13 +142,17 @@ def get_historical_breadth(raw_data, universe_keys, b_df_index):
         close = df['Close']
         high = df['High']
         
+        # A/D Line processing
+        daily_diff = close.diff()
+        advancers = (daily_diff > 0).astype(int)
+        decliners = (daily_diff < 0).astype(int)
+        ad_line += (advancers - decliners).reindex(target_idx).fillna(0)
+
         ma50 = close.rolling(50).mean()
         ma200 = close.rolling(200).mean()
-        
         df_weekly = close.resample('W-FRI').last()
         w_ma30 = df_weekly.rolling(30).mean()
         w_slope = (w_ma30 - w_ma30.shift(4)) / w_ma30
-        
         w_ma30_d = w_ma30.reindex(close.index).ffill()
         w_slope_d = w_slope.reindex(close.index).ffill()
         high52 = high.rolling(252, min_periods=100).max()
@@ -172,11 +167,10 @@ def get_historical_breadth(raw_data, universe_keys, b_df_index):
         count_uni += close.notna().astype(int).reindex(target_idx).fillna(0)
 
     safe_uni = count_uni.replace(0, 1)
-    return (count_50 / safe_uni * 100).tolist(), (count_200 / safe_uni * 100).tolist(), count_2a.tolist(), count_3.tolist(), count_uni.tolist()
+    return (count_50 / safe_uni * 100).tolist(), (count_200 / safe_uni * 100).tolist(), count_2a.tolist(), count_3.tolist(), count_uni.tolist(), ad_line.cumsum().tolist()
 
 def calculate_metrics(sym, df, bench_series, itype):
     df.index = pd.to_datetime(df.index).tz_localize(None)
-    
     if len(df) < 130: return None
     close = df["Close"]
     high = df["High"]
@@ -192,7 +186,6 @@ def calculate_metrics(sym, df, bench_series, itype):
     ma150 = float(close.rolling(150).mean().iloc[-1])
     ma200 = float(close.rolling(200).mean().iloc[-1]) if n >= 200 else price
     
-    # Authentic Continuous MA200 Rising Check
     ma200_10d = float(close.rolling(200).mean().iloc[-11]) if n >= 210 else price
     ma200_22d = float(close.rolling(200).mean().iloc[-23]) if n >= 222 else price
     ma200_rising = (ma200 > ma200_10d) and (ma200_10d > ma200_22d)
@@ -206,9 +199,10 @@ def calculate_metrics(sym, df, bench_series, itype):
     high52 = float(high.iloc[-min(n, 252):].max())
     low52 = float(low.iloc[-min(n, 252):].min())
 
-    # Prior Resistance (excludes today)
     prior_resistance = float(high.iloc[-21:-1].max()) if n >= 21 else price
     pivot_dist = ((prior_resistance - price) / price) * 100.0 if price > 0.0 else 0.0
+
+    adr = float(((high.iloc[-20:] / low.iloc[-20:]) - 1).mean() * 100) if n >= 20 else 0.0
 
     checklist = {
         "Price > 150 & 200 MA": price > ma150 and price > ma200,
@@ -219,7 +213,6 @@ def calculate_metrics(sym, df, bench_series, itype):
         "Price ≥ 30% Above 52W Low": price >= (low52 * 1.30) if itype == "Equity" else price >= (low52 * 1.15),
         "Price Within 25% of 52W High": price >= (high52 * 0.75)
     }
-
     tt_pass = checklist["Price > 150 & 200 MA"] and checklist["Price > 50 MA"]
 
     def get_ret(d_start, d_end):
@@ -227,11 +220,21 @@ def calculate_metrics(sym, df, bench_series, itype):
         p_start = float(close.iloc[-d_start])
         return (float(close.iloc[-d_end]) - p_start) / p_start if p_start > 0.0 else 0.0
 
+    ret_1m = get_ret(22, 1) * 100
+    ret_3m = get_ret(64, 1) * 100
+
     ret_q1 = get_ret(63, 1)
     ret_q2 = get_ret(126, 64)
     ret_q3 = get_ret(189, 127)
     ret_q4 = get_ret(252, 190)
     raw_rs = (0.40 * ret_q1) + (0.20 * ret_q2) + (0.20 * ret_q3) + (0.20 * ret_q4)
+
+    # RS 1-Month Ago Calculation for RS Shift
+    ret_q1_1m = get_ret(63+21, 1+21)
+    ret_q2_1m = get_ret(126+21, 64+21)
+    ret_q3_1m = get_ret(189+21, 127+21)
+    ret_q4_1m = get_ret(252+21, 190+21)
+    raw_rs_1m = (0.40 * ret_q1_1m) + (0.20 * ret_q2_1m) + (0.20 * ret_q3_1m) + (0.20 * ret_q4_1m)
 
     avg_vol20 = float(volume.iloc[-21:-1].mean()) if n >= 21 else 1.0
     avg_vol50 = float(volume.iloc[-51:-1].mean()) if n >= 51 else avg_vol20
@@ -240,7 +243,6 @@ def calculate_metrics(sym, df, bench_series, itype):
     adtv = avg_vol20 * price
     adtv_fmt = f"${adtv/1e6:.1f}M" if adtv >= 1e6 else f"${round(adtv/1e3)}k"
 
-    # Intraday Volume Normalization (AEST)
     now = pd.Timestamp.now(tz=pytz.timezone('Australia/Sydney'))
     if now.weekday() < 5 and 10 <= now.hour < 16:
         elapsed_mins = (now.hour - 10) * 60 + now.minute
@@ -248,48 +250,33 @@ def calculate_metrics(sym, df, bench_series, itype):
     else:
         projected_vol = curr_vol
 
-    # Contiguous Weinstein Stages
     stage_raw = "1"
     stage = "Stage 1 (Basing)"
     
     if weekly_slope > 0.002: 
-        if price < weekly_ma30 * 0.98:
-            stage, stage_raw = "Stage 1 (Basing)", "1"
-        elif (price - weekly_ma30) / weekly_ma30 > 0.25:
-            stage, stage_raw = "Stage 2B (Late Uptrend)", "2B"
-        elif (high52 - price) / high52 <= 0.15:
-            stage, stage_raw = "Stage 2A (Early Markup)", "2A"
-        else:
-            stage, stage_raw = "Stage 2 (Advancing)", "2"
-            
+        if price < weekly_ma30 * 0.98: stage, stage_raw = "Stage 1 (Basing)", "1"
+        elif (price - weekly_ma30) / weekly_ma30 > 0.25: stage, stage_raw = "Stage 2B (Late Uptrend)", "2B"
+        elif (high52 - price) / high52 <= 0.15: stage, stage_raw = "Stage 2A (Early Markup)", "2A"
+        else: stage, stage_raw = "Stage 2 (Advancing)", "2"
     elif weekly_slope < -0.002:
-        if price >= weekly_ma30 * 0.98:
-            stage, stage_raw = "Stage 1 (Basing)", "1"
-        else:
-            stage, stage_raw = "Stage 4 (Downtrend)", "4"
-        
-    else: # [-0.002, 0.002]
-        if (high52 - price) / high52 < 0.20 and price < weekly_ma30 * 1.05 and price > weekly_ma30 * 0.85:
-            stage, stage_raw = "Stage 3 (Distribution)", "3"
-        else:
-            stage, stage_raw = "Stage 1 (Basing)", "1"
+        if price >= weekly_ma30 * 0.98: stage, stage_raw = "Stage 1 (Basing)", "1"
+        else: stage, stage_raw = "Stage 4 (Downtrend)", "4"
+    else: 
+        if (high52 - price) / high52 < 0.20 and price < weekly_ma30 * 1.05 and price > weekly_ma30 * 0.85: stage, stage_raw = "Stage 3 (Distribution)", "3"
+        else: stage, stage_raw = "Stage 1 (Basing)", "1"
 
-    # Authentic Volatility Calculation (Dynamic ATR)
     tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
     atr_14 = float(tr.rolling(14).mean().iloc[-1]) if n >= 14 else 0.0
 
     max_20d = float(high.iloc[-20:].max()) if n >= 20 else price
     min_20d = float(low.iloc[-20:].min()) if n >= 20 else price
     range_20d_pct = (max_20d - min_20d) / min_20d if min_20d > 0 else 0
-    
     max_5d = float(high.iloc[-5:].max()) if n >= 5 else price
     min_5d = float(low.iloc[-5:].min()) if n >= 5 else price
     range_5d_abs = max_5d - min_5d
-    
     position_20d = (price - min_20d) / (max_20d - min_20d) if max_20d > min_20d else 0
     vdu = projected_vol < (avg_vol50 * 0.5)
 
-    # Authentic Pocket Pivot Prior Down-Volume Check
     max_down_vol = 0.0
     if n >= 12:
         last_10_closes = close.iloc[-12:-1]
@@ -298,19 +285,15 @@ def calculate_metrics(sym, df, bench_series, itype):
         max_down_vol = float(down_vols.max()) if len(down_vols) > 0 else 0.0
 
     setup = "No Setup"
-    
     if tt_pass and stage_raw in ["2A", "2"]:
-        # Precedence 1: Breakout against prior resistance
-        if price >= (prior_resistance * 0.99) and rvol >= 1.5 and change > 2.0:
-            setup = "Stage 2 Breakout"
-        # Precedence 2: Pocket Pivot inside base
-        elif change > 0 and curr_vol > max_down_vol and max_down_vol > 0 and position_20d > 0.3:
-            setup = "Pocket Pivot"
-        # Precedence 3: VCP Base Tightening
-        elif range_20d_pct <= 0.25 and range_5d_abs <= (1.5 * atr_14) and position_20d > 0.5 and vdu:
-            setup = "VCP Contraction"
+        if price >= (prior_resistance * 0.99) and rvol >= 1.5 and change > 2.0: setup = "Stage 2 Breakout"
+        elif change > 0 and curr_vol > max_down_vol and max_down_vol > 0 and position_20d > 0.3: setup = "Pocket Pivot"
+        elif range_20d_pct <= 0.25 and range_5d_abs <= (1.5 * atr_14) and position_20d > 0.5 and vdu: setup = "VCP Contraction"
 
     mrs_series = []
+    pure_rs_series = []
+    dates_252 = []
+    price_252 = []
     if bench_series is not None:
         bench_series.index = pd.to_datetime(bench_series.index).tz_localize(None)
         common_idx = close.index.intersection(bench_series.index)
@@ -319,12 +302,19 @@ def calculate_metrics(sym, df, bench_series, itype):
             ratio_ma = ratio.rolling(52).mean()
             mrs_curve = ((ratio / ratio_ma) - 1.0) * 10.0
             mrs_series = mrs_curve.reindex(close.index).ffill().iloc[-90:].tolist()
+            
+            # Extract Pure RS Line for individual chart
+            pure_rs_series = ratio.reindex(close.index).ffill().iloc[-252:].tolist()
+            dates_252 = close.index[-252:].strftime('%Y-%m-%d').tolist()
+            price_252 = close.iloc[-252:].tolist()
 
     return {
-        "price": price, "change": change, "pivot_dist": pivot_dist, "raw_rs": raw_rs, 
+        "price": price, "change": change, "ret_1m": ret_1m, "ret_3m": ret_3m,
+        "pivot_dist": pivot_dist, "adr": adr, "raw_rs": raw_rs, "raw_rs_1m": raw_rs_1m, 
         "adtv": adtv, "adtv_fmt": adtv_fmt, "checklist": checklist, "trend_score": sum(checklist.values()),
         "stage": stage, "stage_raw": stage_raw, "setup": setup,
-        "mrs_series": mrs_series, "above_50": price > ma50, "above_200": price > ma200
+        "mrs_series": mrs_series, "pure_rs_series": pure_rs_series, "dates_252": dates_252, "price_252": price_252,
+        "above_50": price > ma50, "above_200": price > ma200
     }
 
 def main():
@@ -376,7 +366,7 @@ def main():
 
     b_df.index = pd.to_datetime(b_df.index).tz_localize(None)
     last_valid_date = b_df.index[-1].strftime('%d %b %Y')
-    st.info(f"💡 **Benchmark Data Note:** {bench_info['name']} ({bench_info['symbol']}) is utilizing the last valid closing data from **{last_valid_date}**.")
+    bench_dates_recent = b_df.index[-125:].strftime('%Y-%m-%d').tolist()
 
     bench_price, b_prev = float(b_df["Close"].iloc[-1]), float(b_df["Close"].iloc[-2])
     bench_change = ((bench_price - b_prev) / b_prev) * 100.0
@@ -401,9 +391,16 @@ def main():
     if missing_data and universe_mode == "Core & Watchlist (Fast)": 
         st.toast(f"Excluded due to missing/insufficient data: {', '.join(missing_data)}")
 
+    # Calculate Historical RS (1 Month Ago)
+    processed_list.sort(key=lambda x: x["raw_rs_1m"])
+    for idx, item in enumerate(processed_list):
+        item["rs_1m"] = max(1, min(99, round(((idx + 1) / len(processed_list)) * 99)))
+
+    # Calculate Current RS & Shift
     processed_list.sort(key=lambda x: x["raw_rs"])
     for idx, item in enumerate(processed_list):
         item["rs"] = max(1, min(99, round(((idx + 1) / len(processed_list)) * 99)))
+        item["rs_shift"] = item["rs"] - item["rs_1m"]
         mrs_v = round((item["rs"] - 50) / 15.0, 1)
         
         traj = "Flat"
@@ -420,8 +417,7 @@ def main():
         item["mrs"] = f"{sign}{mrs_v} ({traj})"
 
     df_all = pd.DataFrame(processed_list)
-
-    h_50, h_200, h_2a, h_3, h_uni = get_historical_breadth(raw_data, active_universe.keys(), b_df.index)
+    h_50, h_200, h_2a, h_3, h_uni, h_ad = get_historical_breadth(raw_data, active_universe.keys(), b_df.index)
 
     total_u = len(df_all)
     pct_50 = (df_all["above_50"].sum() / total_u * 100.0) if total_u > 0 else 0.0
@@ -429,147 +425,196 @@ def main():
     stage_2a_count = sum(df_all["stage_raw"] == "2A")
     stage_3_count = sum(df_all["stage_raw"] == "3")
 
+    # TOP KPI CARDS
     k1, k2, k3, k4, k5, k6 = st.columns(6)
-    
-    with k1:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>{bench_info["short"]} REGIME</span><span style="color:#94a3b8;">{bench_price:,.0f} ({bench_change:+.2f}%)</span></div><div class="kpi-val" style="color:{"#22c55e" if power_trend_on else "#f59e0b"};">{"● Power Trend ON" if power_trend_on else "○ Correction"}</div>{make_sparkline_svg(bench_spark_vals, stroke_color="#22c55e" if power_trend_on else "#f59e0b", fill_color="rgba(34,197,94,0.15)" if power_trend_on else "rgba(245,158,11,0.15)")}</div>', unsafe_allow_html=True)
-    with k2:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>% &gt; 50-DAY MA</span></div><div class="kpi-val" style="color:#f8fafc;">{pct_50:.1f}%</div>{make_sparkline_svg(h_50, stroke_color="#38bdf8", fill_color="rgba(56,189,248,0.15)")}</div>', unsafe_allow_html=True)
-    with k3:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>% &gt; 200-DAY MA</span></div><div class="kpi-val" style="color:#f8fafc;">{pct_200:.1f}%</div>{make_sparkline_svg(h_200, stroke_color="#818cf8", fill_color="rgba(129,140,248,0.15)")}</div>', unsafe_allow_html=True)
-    with k4:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>STAGE 2A LEADERS</span></div><div class="kpi-val" style="color:#22c55e;">{stage_2a_count} Breaking Out</div>{make_sparkline_svg(h_2a, stroke_color="#22c55e", fill_color="rgba(34,197,94,0.15)")}</div>', unsafe_allow_html=True)
-    with k5:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>STAGE 3 DISTRIBUTION</span></div><div class="kpi-val" style="color:#f43f5e;">{stage_3_count} Topping</div>{make_sparkline_svg(h_3, stroke_color="#f43f5e", fill_color="rgba(244,63,94,0.15)")}</div>', unsafe_allow_html=True)
-    with k6:
-        st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>UNIVERSE</span></div><div class="kpi-val" style="color:#c084fc;">{total_u} Scanned</div>{make_sparkline_svg(h_uni, stroke_color="#c084fc", fill_color="rgba(192,132,252,0.15)")}</div>', unsafe_allow_html=True)
+    with k1: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>{bench_info["short"]} REGIME</span><span style="color:#94a3b8;">{bench_price:,.0f} ({bench_change:+.2f}%)</span></div><div class="kpi-val" style="color:{"#22c55e" if power_trend_on else "#f59e0b"};">{"● Power Trend ON" if power_trend_on else "○ Correction"}</div>{make_sparkline_svg(bench_spark_vals, stroke_color="#22c55e" if power_trend_on else "#f59e0b", fill_color="rgba(34,197,94,0.15)" if power_trend_on else "rgba(245,158,11,0.15)")}</div>', unsafe_allow_html=True)
+    with k2: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>% &gt; 50-DAY MA</span></div><div class="kpi-val" style="color:#f8fafc;">{pct_50:.1f}%</div>{make_sparkline_svg(h_50, stroke_color="#38bdf8", fill_color="rgba(56,189,248,0.15)")}</div>', unsafe_allow_html=True)
+    with k3: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>% &gt; 200-DAY MA</span></div><div class="kpi-val" style="color:#f8fafc;">{pct_200:.1f}%</div>{make_sparkline_svg(h_200, stroke_color="#818cf8", fill_color="rgba(129,140,248,0.15)")}</div>', unsafe_allow_html=True)
+    with k4: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>STAGE 2A LEADERS</span></div><div class="kpi-val" style="color:#22c55e;">{stage_2a_count} Breaking Out</div>{make_sparkline_svg(h_2a, stroke_color="#22c55e", fill_color="rgba(34,197,94,0.15)")}</div>', unsafe_allow_html=True)
+    with k5: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>STAGE 3 DISTRIBUTION</span></div><div class="kpi-val" style="color:#f43f5e;">{stage_3_count} Topping</div>{make_sparkline_svg(h_3, stroke_color="#f43f5e", fill_color="rgba(244,63,94,0.15)")}</div>', unsafe_allow_html=True)
+    with k6: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>UNIVERSE</span></div><div class="kpi-val" style="color:#c084fc;">{total_u} Scanned</div>{make_sparkline_svg(h_uni, stroke_color="#c084fc", fill_color="rgba(192,132,252,0.15)")}</div>', unsafe_allow_html=True)
 
-    st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
-    
-    with st.container(border=True):
-        f1, f2, f3, f4, f5, f6, f7 = st.columns([2.0, 1.2, 1.5, 1.5, 1.5, 1.5, 0.8])
-        search_query = f1.text_input("Search", "", placeholder="Search Ticker..", label_visibility="collapsed").strip().lower()
-        price_filter = f2.selectbox("Price", ["All Prices", "> $0.10", "> $0.50", "> $1.00", "> $5.00", "> $10.00"], label_visibility="collapsed")
-        substage_filter = f3.selectbox("Stage", ["All Stages", "Stage 2A", "Stage 1B", "Stage 3", "Stage 4"], label_visibility="collapsed")
-        min_rs = f4.slider("Min RS", 0, 95, 0, 5, label_visibility="collapsed")
-        theme_filter = f5.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in active_universe.values()))), label_visibility="collapsed")
-        setup_filter = f6.selectbox("Setup", ["All Setups", "VCP Contraction", "Stage 2 Breakout", "Pocket Pivot", "No Setup"], label_visibility="collapsed")
+    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+
+    # MAIN APPLICATION TABS
+    tab1, tab2 = st.tabs(["📊 Screener & Setup Charts", "🌍 Macro Breadth & Theme Rotation"])
+
+    with tab1:
+        with st.container(border=True):
+            f1, f2, f3, f4, f5, f6, f7 = st.columns([2.0, 1.2, 1.5, 1.5, 1.5, 1.5, 0.8])
+            search_query = f1.text_input("Search", "", placeholder="Search Ticker..", label_visibility="collapsed").strip().lower()
+            price_filter = f2.selectbox("Price", ["All Prices", "> $0.10", "> $0.50", "> $1.00", "> $5.00", "> $10.00"], label_visibility="collapsed")
+            substage_filter = f3.selectbox("Stage", ["All Stages", "Stage 2A", "Stage 1B", "Stage 3", "Stage 4"], label_visibility="collapsed")
+            min_rs = f4.slider("Min RS", 0, 95, 0, 5, label_visibility="collapsed")
+            theme_filter = f5.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in active_universe.values()))), label_visibility="collapsed")
+            setup_filter = f6.selectbox("Setup", ["All Setups", "VCP Contraction", "Stage 2 Breakout", "Pocket Pivot", "No Setup"], label_visibility="collapsed")
+            if f7.button("Reset All", use_container_width=True):
+                st.session_state.show_starred_only = False
+                st.cache_data.clear()
+                st.rerun()
+
+        df = df_all.copy()
+        if price_filter != "All Prices":
+            min_price = float(price_filter.replace("> $", ""))
+            df = df[df["price"] > min_price]
+        if st.session_state.show_starred_only: df = df[df["ticker"].isin(st.session_state.watchlist)]
+        if search_query: df = df[df["ticker"].str.lower().str.contains(search_query)]
+        if theme_filter != "All Themes": df = df[df["theme"] == theme_filter]
+        if substage_filter != "All Stages": df = df[df["stage_raw"] == substage_filter.split(" ")[1]]
+        if setup_filter != "All Setups": df = df[df["setup"] == setup_filter]
+        df = df[df["rs"] >= min_rs]
+
+        df_display = df[["ticker", "name", "price", "change", "ret_1m", "ret_3m", "pivot_dist", "adr", "rs", "rs_shift", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].copy()
+        df_display.columns = ["TICKER", "NAME", "PRICE", "TODAY %", "1M %", "3M %", "PIVOT DIST %", "ADR %", "RS", "RS-S", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
         
-        if f7.button("Reset All", use_container_width=True):
-            st.session_state.show_starred_only = False
-            st.cache_data.clear()
-            st.rerun()
+        df_display.insert(0, "STARRED", df_display["TICKER"].apply(lambda x: x in st.session_state.watchlist))
+        df_display.insert(1, "CHART", False)
+        df_display = df_display.sort_values(by="RS", ascending=False).reset_index(drop=True)
 
-    df = df_all.copy()
-    
-    if price_filter != "All Prices":
-        min_price = float(price_filter.replace("> $", ""))
-        df = df[df["price"] > min_price]
+        editor_key = "watchlist_editor"
+        disabled_cols = ["TICKER", "NAME", "PRICE", "TODAY %", "1M %", "3M %", "PIVOT DIST %", "ADR %", "RS", "RS-S", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
         
-    if st.session_state.show_starred_only:
-        df = df[df["ticker"].isin(st.session_state.watchlist)]
-        
-    if search_query: df = df[df["ticker"].str.lower().str.contains(search_query)]
-    if theme_filter != "All Themes": df = df[df["theme"] == theme_filter]
-    if substage_filter != "All Stages": df = df[df["stage_raw"] == substage_filter.split(" ")[1]]
-    if setup_filter != "All Setups": df = df[df["setup"] == setup_filter]
-    df = df[df["rs"] >= min_rs]
+        st.data_editor(
+            df_display,
+            column_config={
+                "STARRED": st.column_config.CheckboxColumn("STARRED", help="Add to Watchlist", default=False),
+                "CHART": st.column_config.CheckboxColumn("CHART", help="Send to TV Chart", default=False),
+                "1M %": st.column_config.NumberColumn("1M %", format="%.1f%%"),
+                "3M %": st.column_config.NumberColumn("3M %", format="%.1f%%"),
+                "PIVOT DIST %": st.column_config.NumberColumn("PIVOT DIST %", format="%.1f%%"),
+                "ADR %": st.column_config.NumberColumn("ADR %", format="%.2f%%"),
+            },
+            disabled=disabled_cols,
+            use_container_width=True, 
+            height=360,
+            key=editor_key
+        )
 
-    df_display = df[["ticker", "name", "price", "change", "pivot_dist", "rs", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].copy()
-    df_display.columns = ["TICKER", "NAME", "PRICE", "TODAY %", "PIVOT DIST %", "RS", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
-    
-    df_display.insert(0, "STARRED", df_display["TICKER"].apply(lambda x: x in st.session_state.watchlist))
-    df_display.insert(1, "CHART", False)
-    
-    df_display = df_display.sort_values(by="RS", ascending=False).reset_index(drop=True)
+        if editor_key in st.session_state and st.session_state[editor_key].get("edited_rows"):
+            rerun_needed = False
+            for row_idx, edit in st.session_state[editor_key]["edited_rows"].items():
+                if "STARRED" in edit:
+                    changed_ticker = df_display.iloc[row_idx]["TICKER"]
+                    if edit["STARRED"]: st.session_state.watchlist.add(changed_ticker)
+                    else: st.session_state.watchlist.discard(changed_ticker)
+                    update_query_watchlist()
+                    rerun_needed = True
+                if "CHART" in edit and edit["CHART"]:
+                    st.session_state.active_ticker = df_display.iloc[row_idx]["TICKER"]
+                    st.session_state.insp_dropdown = st.session_state.active_ticker
+                    rerun_needed = True
+            if rerun_needed:
+                del st.session_state[editor_key]
+                st.rerun()
 
-    editor_key = "watchlist_editor"
-    disabled_cols = ["TICKER", "NAME", "PRICE", "TODAY %", "PIVOT DIST %", "RS", "MANSFIELD RS", "MINERVINI TREND", "WEINSTEIN STAGE", "SETUP", "$ADTV"]
-    
-    event = st.data_editor(
-        df_display,
-        column_config={
-            "STARRED": st.column_config.CheckboxColumn("STARRED", help="Add to Watchlist", default=False),
-            "CHART": st.column_config.CheckboxColumn("CHART", help="Send to TV Chart", default=False),
-            "PIVOT DIST %": st.column_config.NumberColumn("PIVOT DIST %", format="%.1f%%")
-        },
-        disabled=disabled_cols,
-        use_container_width=True, 
-        height=380,
-        key=editor_key
-    )
+        if len(df_all) > 0:
+            with st.expander("🔍 **Analyze Instrument & Relative Strength Breakdown**", expanded=True):
+                all_tickers = sorted(df_all["ticker"].tolist())
+                if not st.session_state.active_ticker or st.session_state.active_ticker not in all_tickers:
+                    st.session_state.active_ticker = all_tickers[0]
 
-    if editor_key in st.session_state and st.session_state[editor_key].get("edited_rows"):
-        rerun_needed = False
-        for row_idx, edit in st.session_state[editor_key]["edited_rows"].items():
-            if "STARRED" in edit:
-                changed_ticker = df_display.iloc[row_idx]["TICKER"]
-                if edit["STARRED"]:
-                    st.session_state.watchlist.add(changed_ticker)
-                else:
-                    st.session_state.watchlist.discard(changed_ticker)
-                update_query_watchlist()
-                rerun_needed = True
+                def dropdown_callback():
+                    st.session_state.active_ticker = st.session_state.insp_dropdown
+
+                sel_idx = all_tickers.index(st.session_state.active_ticker)
+                st.selectbox("Select Instrument to Chart:", all_tickers, index=sel_idx, key="insp_dropdown", on_change=dropdown_callback)
                 
-            if "CHART" in edit and edit["CHART"]:
-                clicked_ticker = df_display.iloc[row_idx]["TICKER"]
-                st.session_state.active_ticker = clicked_ticker
-                st.session_state.insp_dropdown = clicked_ticker
-                rerun_needed = True
-                
-        if rerun_needed:
-            del st.session_state[editor_key]
-            st.rerun()
+                selected_row = df_all[df_all["ticker"] == st.session_state.active_ticker].iloc[0]
 
-    if len(df_all) > 0:
-        with st.expander("🔍 **Analyze Instrument & TradingView Advanced Chart**", expanded=True):
+                st.markdown("<div style='margin-top:4px; margin-bottom:8px; font-weight:700; font-size:0.75rem; text-transform:uppercase;'>Minervini Trend Template Checklist:</div>", unsafe_allow_html=True)
+                check_cols = st.columns(len(selected_row["checklist"]))
+                for col, (k, v) in zip(check_cols, selected_row["checklist"].items()):
+                    col.markdown(f"<div style='color:{'#22c55e' if v else '#f43f5e'}; font-size:0.7rem; font-weight:600; text-align:center;'>{'✓' if v else '✗'} {k}</div>", unsafe_allow_html=True)
+                st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+
+                tv_html = f"""
+                <div class="tradingview-widget-container" style="height:550px;width:100%">
+                  <div id="tradingview_{st.session_state.active_ticker}" style="height:100%;width:100%"></div>
+                  <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+                  <script type="text/javascript">
+                  new TradingView.widget(
+                  {{
+                  "autosize": true,
+                  "symbol": "ASX:{st.session_state.active_ticker}",
+                  "interval": "D",
+                  "timezone": "Australia/Sydney",
+                  "theme": "dark",
+                  "style": "1",
+                  "locale": "en",
+                  "enable_publishing": false,
+                  "backgroundColor": "#0b0f19",
+                  "gridColor": "#1e293b",
+                  "hide_top_toolbar": false,
+                  "hide_legend": false,
+                  "save_image": false,
+                  "container_id": "tradingview_{st.session_state.active_ticker}"
+                }}
+                  );
+                  </script>
+                </div>
+                """
+                components.html(tv_html, height=550)
+
+                # Pure RS Line Chart
+                if len(selected_row["dates_252"]) > 0:
+                    fig_rs = make_subplots(specs=[[{"secondary_y": True}]])
+                    fig_rs.add_trace(go.Scatter(x=selected_row["dates_252"], y=selected_row["price_252"], name="Price", line=dict(color="#f8fafc", width=1.5)), secondary_y=False)
+                    fig_rs.add_trace(go.Scatter(x=selected_row["dates_252"], y=selected_row["pure_rs_series"], name="Pure RS Line", line=dict(color="#818cf8", width=2.0)), secondary_y=True)
+                    fig_rs.update_layout(
+                        title=f"{st.session_state.active_ticker} Price vs Pure Relative Strength Line (1 Year)",
+                        height=280, margin=dict(l=10, r=10, t=40, b=10),
+                        template="plotly_dark", plot_bgcolor="#0b0f19", paper_bgcolor="#0b0f19",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1)
+                    )
+                    fig_rs.update_yaxes(title_text="Price", secondary_y=False, showgrid=False)
+                    fig_rs.update_yaxes(title_text="RS Line", secondary_y=True, showgrid=False)
+                    st.plotly_chart(fig_rs, use_container_width=True)
+
+    with tab2:
+        st.markdown("### Institutional Macro & Theme Leadership")
+        c1, c2 = st.columns([6, 4])
+        
+        with c1:
+            st.markdown("<div style='font-size:0.85rem; font-weight:700; color:#94a3b8; margin-bottom:10px;'>CUMULATIVE ADVANCE / DECLINE LINE</div>", unsafe_allow_html=True)
+            fig_ad = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.5, 0.5])
+            fig_ad.add_trace(go.Scatter(x=bench_dates_recent, y=bench_spark_vals, name=bench_info["short"], line=dict(color="#38bdf8", width=2)), row=1, col=1)
+            fig_ad.add_trace(go.Scatter(x=bench_dates_recent, y=h_ad, name="A/D Line", line=dict(color="#a855f7", width=2)), row=2, col=1)
+            fig_ad.update_layout(height=350, margin=dict(l=0, r=0, t=10, b=0), template="plotly_dark", plot_bgcolor="#0b0f19", paper_bgcolor="#0b0f19", showlegend=False)
+            fig_ad.update_yaxes(showgrid=True, gridcolor="#1e293b", zeroline=False)
+            st.plotly_chart(fig_ad, use_container_width=True)
+
+            st.markdown("<div style='font-size:0.85rem; font-weight:700; color:#94a3b8; margin-bottom:10px; margin-top:20px;'>MARKET BREADTH OSCILLATORS</div>", unsafe_allow_html=True)
+            fig_br = go.Figure()
+            fig_br.add_trace(go.Scatter(x=bench_dates_recent, y=h_50, name="% > 50MA", line=dict(color="#22c55e", width=2)))
+            fig_br.add_trace(go.Scatter(x=bench_dates_recent, y=h_200, name="% > 200MA", line=dict(color="#f59e0b", width=2)))
+            fig_br.add_hrect(y0=80, y1=100, fillcolor="red", opacity=0.1, line_width=0)
+            fig_br.add_hrect(y0=0, y1=20, fillcolor="green", opacity=0.1, line_width=0)
+            fig_br.add_hline(y=80, line_dash="dot", line_color="red", opacity=0.5)
+            fig_br.add_hline(y=20, line_dash="dot", line_color="green", opacity=0.5)
+            fig_br.update_layout(height=280, margin=dict(l=0, r=0, t=10, b=0), template="plotly_dark", plot_bgcolor="#0b0f19", paper_bgcolor="#0b0f19", yaxis=dict(range=[0,100]), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+            st.plotly_chart(fig_br, use_container_width=True)
+
+        with c2:
+            st.markdown("<div style='font-size:0.85rem; font-weight:700; color:#94a3b8; margin-bottom:10px;'>GICS THEME LEADERSHIP</div>", unsafe_allow_html=True)
+            theme_df = df_all.groupby('theme').agg(
+                Stocks=('ticker', 'count'),
+                Avg_RS=('rs', 'mean'),
+                Stage2A_Count=('stage_raw', lambda x: (x == '2A').sum())
+            ).reset_index()
+            theme_df['% Stage 2A'] = (theme_df['Stage2A_Count'] / theme_df['Stocks']) * 100.0
+            theme_df = theme_df[theme_df['Stocks'] >= 3].sort_values('Avg_RS', ascending=False)
             
-            all_tickers = sorted(df_all["ticker"].tolist())
-            if not st.session_state.active_ticker or st.session_state.active_ticker not in all_tickers:
-                st.session_state.active_ticker = all_tickers[0]
-
-            def dropdown_callback():
-                st.session_state.active_ticker = st.session_state.insp_dropdown
-
-            sel_idx = all_tickers.index(st.session_state.active_ticker)
-            st.selectbox("Select Instrument to Chart:", all_tickers, index=sel_idx, key="insp_dropdown", on_change=dropdown_callback)
-            
-            selected_row = df_all[df_all["ticker"] == st.session_state.active_ticker].iloc[0]
-
-            st.markdown("<div style='margin-top:4px; margin-bottom:8px; font-weight:700; font-size:0.75rem; text-transform:uppercase;'>Minervini Trend Template Checklist:</div>", unsafe_allow_html=True)
-            check_cols = st.columns(len(selected_row["checklist"]))
-            for col, (k, v) in zip(check_cols, selected_row["checklist"].items()):
-                col.markdown(f"<div style='color:{'#22c55e' if v else '#f43f5e'}; font-size:0.7rem; font-weight:600; text-align:center;'>{'✓' if v else '✗'} {k}</div>", unsafe_allow_html=True)
-            
-            st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
-
-            tv_html = f"""
-            <div class="tradingview-widget-container" style="height:650px;width:100%">
-              <div id="tradingview_{st.session_state.active_ticker}" style="height:100%;width:100%"></div>
-              <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-              <script type="text/javascript">
-              new TradingView.widget(
-              {{
-              "autosize": true,
-              "symbol": "ASX:{st.session_state.active_ticker}",
-              "interval": "D",
-              "timezone": "Australia/Sydney",
-              "theme": "dark",
-              "style": "1",
-              "locale": "en",
-              "enable_publishing": false,
-              "backgroundColor": "#0b0f19",
-              "gridColor": "#1e293b",
-              "hide_top_toolbar": false,
-              "hide_legend": false,
-              "save_image": false,
-              "container_id": "tradingview_{st.session_state.active_ticker}"
-            }}
-              );
-              </script>
-            </div>
-            """
-            components.html(tv_html, height=650)
+            st.dataframe(
+                theme_df[['theme', 'Stocks', 'Avg_RS', '% Stage 2A']],
+                column_config={
+                    "theme": "Theme / Industry",
+                    "Avg_RS": st.column_config.NumberColumn("Avg RS", format="%.1f"),
+                    "% Stage 2A": st.column_config.ProgressColumn("% Stage 2A", format="%.1f%%", min_value=0, max_value=100)
+                },
+                hide_index=True,
+                use_container_width=True,
+                height=680
+            )
 
 if __name__ == "__main__":
     main()
