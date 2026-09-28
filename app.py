@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v9.1)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v10.0)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages (1-4, including Stage 3 Distribution).
@@ -10,16 +10,15 @@ Refactored Engine:
   - Phase 2: Live rolling market breadth (no synthetic data).
   - Phase 4: Timezone-stripped DatetimeIndex for safe resampling.
   - Phase 4: Added .ffill() to raw data to prevent Yahoo NaNs from excluding stocks.
-  - PATCH 4: Split API Fetch to bypass yfinance Multi-Index bug for benchmark.
-  - PATCH 8: Resolved st.data_editor TypeError with interactive CHART action column.
-  - PATCH 10: Fixed TradingView Widget vertical compression.
-  - PATCH 11: Added ZeroDivisionError safeguards for defunct stocks.
   - UPDATE: Dynamic Universe Integration (Live ASX Directory Scraping via Markit API).
   - UPDATE: Distance to Pivot (%) calculation added to identify tight base breakouts.
-  - UPDATE: Hardened Weinstein Stage logic based on 30w MA smoothed slopes.
-  - UPDATE: Enforced Minervini Trend Template prerequisites for all VCP setups.
-  - UPDATE: Added base depth and positional constraints to block falling knife false positives.
-  - NEW: Integrated dropdown Price Filter (e.g., > $0.10) to strip illiquid penny stocks.
+  - UPDATE: Integrated dropdown Price Filter (e.g., > $0.10).
+  - FIX: Hardened contiguous Weinstein Stage boundaries to eliminate "unclassified" gaps.
+  - FIX: Intraday Volume Normalization (pro-rates volume based on AEST time of day).
+  - FIX: True Minervini Continuous MA (200-day MA must rise sequentially, not just point-to-point).
+  - FIX: Dynamic ATR Tightness for VCP (replaces arbitrary 6% rule).
+  - FIX: True Resistance Breakouts (evaluates strictly against prior 20-day highs, excluding today).
+  - FIX: Authentic Pocket Pivots (volume must exceed max down-volume of prior 10 days).
 ==============================================================================
 """
 
@@ -28,6 +27,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import pytz
 
 st.set_page_config(
     page_title="ASX Relative Strength & VCP Scanner",
@@ -191,7 +191,13 @@ def calculate_metrics(sym, df, bench_series, itype):
     ma50 = float(close.rolling(50).mean().iloc[-1])
     ma150 = float(close.rolling(150).mean().iloc[-1])
     ma200 = float(close.rolling(200).mean().iloc[-1]) if n >= 200 else price
-    ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
+    
+    # Authentic Continuous MA200 Rising Check
+    ma200_10d = float(close.rolling(200).mean().iloc[-11]) if n >= 210 else price
+    ma200_22d = float(close.rolling(200).mean().iloc[-23]) if n >= 222 else price
+    ma200_rising = (ma200 > ma200_10d) and (ma200_10d > ma200_22d)
+
+    slope150 = (ma150 - float(close.rolling(150).mean().iloc[-22])) / ma150 if n >= 172 else 0.0
     
     df_weekly = df.resample('W-FRI').last().dropna(subset=["Close"])
     weekly_ma30 = float(df_weekly["Close"].rolling(30).mean().iloc[-1]) if len(df_weekly) >= 30 else ma150
@@ -200,16 +206,14 @@ def calculate_metrics(sym, df, bench_series, itype):
     high52 = float(high.iloc[-min(n, 252):].max())
     low52 = float(low.iloc[-min(n, 252):].min())
 
-    slope150 = (ma150 - float(close.rolling(150).mean().iloc[-22])) / ma150 if n >= 172 else 0.0
-    slope200 = (ma200 - float(close.rolling(200).mean().iloc[-22])) / ma200 if n >= 222 else 0.0
-
-    pivot_50d = float(high.iloc[-50:].max()) if n >= 50 else float(high.max())
-    pivot_dist = ((pivot_50d - price) / price) * 100.0 if price > 0.0 else 0.0
+    # Prior Resistance (excludes today)
+    prior_resistance = float(high.iloc[-21:-1].max()) if n >= 21 else price
+    pivot_dist = ((prior_resistance - price) / price) * 100.0 if price > 0.0 else 0.0
 
     checklist = {
         "Price > 150 & 200 MA": price > ma150 and price > ma200,
         "150 MA > 200 MA": ma150 > ma200,
-        "200 MA Rising (>1mo)": slope200 > 0.0,
+        "200 MA Rising (>1mo)": ma200_rising,
         "150 MA Rising (>1mo)": slope150 > 0.0,
         "Price > 50 MA": price > ma50,
         "Price ≥ 30% Above 52W Low": price >= (low52 * 1.30) if itype == "Equity" else price >= (low52 * 1.15),
@@ -236,25 +240,43 @@ def calculate_metrics(sym, df, bench_series, itype):
     adtv = avg_vol20 * price
     adtv_fmt = f"${adtv/1e6:.1f}M" if adtv >= 1e6 else f"${round(adtv/1e3)}k"
 
+    # Intraday Volume Normalization (AEST)
+    now = pd.Timestamp.now(tz=pytz.timezone('Australia/Sydney'))
+    if now.weekday() < 5 and 10 <= now.hour < 16:
+        elapsed_mins = (now.hour - 10) * 60 + now.minute
+        projected_vol = curr_vol * (360.0 / max(1.0, float(elapsed_mins)))
+    else:
+        projected_vol = curr_vol
+
+    # Contiguous Weinstein Stages
     stage_raw = "1"
     stage = "Stage 1 (Basing)"
     
-    if price >= weekly_ma30 * 0.98 and weekly_slope > 0.002: 
-        if (price - weekly_ma30) / weekly_ma30 > 0.25:
+    if weekly_slope > 0.002: 
+        if price < weekly_ma30 * 0.98:
+            stage, stage_raw = "Stage 1 (Basing)", "1"
+        elif (price - weekly_ma30) / weekly_ma30 > 0.25:
             stage, stage_raw = "Stage 2B (Late Uptrend)", "2B"
         elif (high52 - price) / high52 <= 0.15:
             stage, stage_raw = "Stage 2A (Early Markup)", "2A"
         else:
             stage, stage_raw = "Stage 2 (Advancing)", "2"
             
-    elif price < weekly_ma30 * 0.98 and weekly_slope < -0.002:
-        stage, stage_raw = "Stage 4 (Downtrend)", "4"
+    elif weekly_slope < -0.002:
+        if price >= weekly_ma30 * 0.98:
+            stage, stage_raw = "Stage 1 (Basing)", "1"
+        else:
+            stage, stage_raw = "Stage 4 (Downtrend)", "4"
         
-    elif weekly_slope <= 0.002 and weekly_slope >= -0.005:
+    else: # [-0.002, 0.002]
         if (high52 - price) / high52 < 0.20 and price < weekly_ma30 * 1.05 and price > weekly_ma30 * 0.85:
             stage, stage_raw = "Stage 3 (Distribution)", "3"
         else:
             stage, stage_raw = "Stage 1 (Basing)", "1"
+
+    # Authentic Volatility Calculation (Dynamic ATR)
+    tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
+    atr_14 = float(tr.rolling(14).mean().iloc[-1]) if n >= 14 else 0.0
 
     max_20d = float(high.iloc[-20:].max()) if n >= 20 else price
     min_20d = float(low.iloc[-20:].min()) if n >= 20 else price
@@ -262,20 +284,31 @@ def calculate_metrics(sym, df, bench_series, itype):
     
     max_5d = float(high.iloc[-5:].max()) if n >= 5 else price
     min_5d = float(low.iloc[-5:].min()) if n >= 5 else price
-    range_5d_pct = (max_5d - min_5d) / min_5d if min_5d > 0 else 0
+    range_5d_abs = max_5d - min_5d
     
     position_20d = (price - min_20d) / (max_20d - min_20d) if max_20d > min_20d else 0
-    vdu = curr_vol < (avg_vol50 * 0.5)
+    vdu = projected_vol < (avg_vol50 * 0.5)
 
-    setup = "Trend Continuation"
+    # Authentic Pocket Pivot Prior Down-Volume Check
+    max_down_vol = 0.0
+    if n >= 12:
+        last_10_closes = close.iloc[-12:-1]
+        last_10_vols = volume.iloc[-11:-1]
+        down_vols = last_10_vols[last_10_closes.diff().iloc[1:].values < 0]
+        max_down_vol = float(down_vols.max()) if len(down_vols) > 0 else 0.0
+
+    setup = "No Setup"
     
     if tt_pass and stage_raw in ["2A", "2"]:
-        if range_20d_pct <= 0.25 and range_5d_pct <= 0.06 and position_20d > 0.5 and vdu:
-            setup = "VCP Contraction"
-        elif position_20d > 0.90 and rvol >= 1.5 and change > 2.0:
+        # Precedence 1: Breakout against prior resistance
+        if price >= (prior_resistance * 0.99) and rvol >= 1.5 and change > 2.0:
             setup = "Stage 2 Breakout"
-        elif price > ma50 and rvol >= 1.5 and change > 0 and position_20d > 0.3:
+        # Precedence 2: Pocket Pivot inside base
+        elif change > 0 and curr_vol > max_down_vol and max_down_vol > 0 and position_20d > 0.3:
             setup = "Pocket Pivot"
+        # Precedence 3: VCP Base Tightening
+        elif range_20d_pct <= 0.25 and range_5d_abs <= (1.5 * atr_14) and position_20d > 0.5 and vdu:
+            setup = "VCP Contraction"
 
     mrs_series = []
     if bench_series is not None:
@@ -420,7 +453,7 @@ def main():
         substage_filter = f3.selectbox("Stage", ["All Stages", "Stage 2A", "Stage 1B", "Stage 3", "Stage 4"], label_visibility="collapsed")
         min_rs = f4.slider("Min RS", 0, 95, 0, 5, label_visibility="collapsed")
         theme_filter = f5.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in active_universe.values()))), label_visibility="collapsed")
-        setup_filter = f6.selectbox("Setup", ["All Setups", "VCP Contraction", "Stage 2 Breakout", "Pocket Pivot"], label_visibility="collapsed")
+        setup_filter = f6.selectbox("Setup", ["All Setups", "VCP Contraction", "Stage 2 Breakout", "Pocket Pivot", "No Setup"], label_visibility="collapsed")
         
         if f7.button("Reset All", use_container_width=True):
             st.session_state.show_starred_only = False
