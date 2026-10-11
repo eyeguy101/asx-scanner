@@ -1,6 +1,6 @@
 """
 ==============================================================================
-ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v11.0)
+ASX Momentum, Relative Strength & VCP Scanner (Pro Cloud Edition v12.0)
 ==============================================================================
 Refactored Engine:
   - Phase 1: Authentic Weinstein Stages & True Minervini slope calculations.
@@ -8,12 +8,11 @@ Refactored Engine:
   - Phase 2: Live rolling market breadth (no synthetic data).
   - Phase 4: Timezone-stripped DatetimeIndex & Yahoo NaN prevention.
   - UPDATE: Dynamic Universe Integration & Pivot Distance (%).
-  - UPDATE: Dropdown Price Filter.
-  - UPDATE: Authentic Pocket Pivots, Dynamic VCP ATR, Contiguous Stages.
-  - NEW (v11.0): Average Daily Range (ADR%) and Multi-Timeframe Returns (1M & 3M).
-  - NEW (v11.0): Relative Strength Shift (RS-S) momentum over 1-month lookback.
-  - NEW (v11.0): Macro Dashboard Tab (A/D Line, Breadth Oscillators, Theme Aggregation).
-  - NEW (v11.0): Interactive Plotly Pure RS Line chart below TradingView widget.
+  - UPDATE: Dropdown Price Filter, ADR%, Multi-Timeframe Returns.
+  - UPDATE: Macro Dashboard Tab (A/D Line, Breadth Oscillators, Themes).
+  - NEW (v12.0): Integrated Darvas Box mechanics (Breakouts & Mini Coils).
+  - NEW (v12.0): Setup overlap confluence (e.g., "VCP + Darvas Coil").
+  - NEW (v12.0): Interactive Darvas sliders added to the main filter bar.
 ==============================================================================
 """
 
@@ -41,7 +40,9 @@ st.markdown("""
     .kpi-title { font-size: 0.64rem; color: #94a3b8; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; display: flex; justify-content: space-between; margin-bottom: 1px; }
     .kpi-val { font-size: 0.98rem; font-weight: 800; font-family: 'JetBrains Mono', 'Menlo', monospace; }
     .asx-badge { background: linear-gradient(135deg, #10b981 0%, #0d9488 50%, #0284c7 100%); color: white; font-weight: 900; font-size: 0.95rem; padding: 6px 10px; border-radius: 8px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.25); }
-    div[data-testid="stRadio"] > label, div[data-testid="stSelectbox"] > label, div[data-testid="stTextInput"] > label, div[data-testid="stSlider"] > label { display: none; }
+    div[data-testid="stRadio"] > label, div[data-testid="stSelectbox"] > label, div[data-testid="stTextInput"] > label { display: none; }
+    /* Target only specific sliders to hide labels but keep numbers visible */
+    div[data-testid="stSlider"] > label { display: none; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] { background-color: #1e293b; border-radius: 4px 4px 0 0; padding: 10px 20px; }
     .stTabs [aria-selected="true"] { background-color: #2563eb !important; color: white !important; font-weight: bold; }
@@ -142,7 +143,6 @@ def get_historical_breadth(raw_data, universe_keys, b_df_index):
         close = df['Close']
         high = df['High']
         
-        # A/D Line processing
         daily_diff = close.diff()
         advancers = (daily_diff > 0).astype(int)
         decliners = (daily_diff < 0).astype(int)
@@ -169,7 +169,7 @@ def get_historical_breadth(raw_data, universe_keys, b_df_index):
     safe_uni = count_uni.replace(0, 1)
     return (count_50 / safe_uni * 100).tolist(), (count_200 / safe_uni * 100).tolist(), count_2a.tolist(), count_3.tolist(), count_uni.tolist(), ad_line.cumsum().tolist()
 
-def calculate_metrics(sym, df, bench_series, itype):
+def calculate_metrics(sym, df, bench_series, itype, darvas_lookback, darvas_vol_thresh):
     df.index = pd.to_datetime(df.index).tz_localize(None)
     if len(df) < 130: return None
     close = df["Close"]
@@ -229,7 +229,6 @@ def calculate_metrics(sym, df, bench_series, itype):
     ret_q4 = get_ret(252, 190)
     raw_rs = (0.40 * ret_q1) + (0.20 * ret_q2) + (0.20 * ret_q3) + (0.20 * ret_q4)
 
-    # RS 1-Month Ago Calculation for RS Shift
     ret_q1_1m = get_ret(63+21, 1+21)
     ret_q2_1m = get_ret(126+21, 64+21)
     ret_q3_1m = get_ret(189+21, 127+21)
@@ -284,11 +283,49 @@ def calculate_metrics(sym, df, bench_series, itype):
         down_vols = last_10_vols[last_10_closes.diff().iloc[1:].values < 0]
         max_down_vol = float(down_vols.max()) if len(down_vols) > 0 else 0.0
 
-    setup = "No Setup"
+    # -------------------------------------------------
+    # Darvas Box Mathematics
+    # -------------------------------------------------
+    darvas_coil = False
+    darvas_bo = False
+    
+    if n >= darvas_lookback + 1:
+        hist_high = high.iloc[-darvas_lookback-1:-1]
+        box_top_idx = np.argmax(hist_high.values) 
+        box_age = darvas_lookback - box_top_idx
+        box_top = float(hist_high.values[box_top_idx])
+        box_bottom = float(low.iloc[-box_age-1:-1].min())
+        box_height_atr = (box_top - box_bottom) / atr_14 if atr_14 > 0 else 0
+        is_mature_box = (box_age >= 5) and (0.3 <= box_height_atr <= 3.0)
+        
+        # Mini Coil Logic
+        is_nr4 = (n >= 4) and (tr.iloc[-1] < min(tr.iloc[-2], tr.iloc[-3], tr.iloc[-4]))
+        is_inside = (n >= 2) and (high.iloc[-1] <= high.iloc[-2]) and (low.iloc[-1] >= low.iloc[-2])
+        is_upper_half = price > (box_bottom + (box_top - box_bottom) * 0.5)
+        
+        darvas_coil = is_mature_box and (is_nr4 or is_inside) and is_upper_half and vdu and (price <= box_top)
+        darvas_bo = is_mature_box and (price > box_top) and (rvol >= darvas_vol_thresh)
+
+    # -------------------------------------------------
+    # Confluence Setup Builder
+    # -------------------------------------------------
+    setup_flags = []
+    
     if tt_pass and stage_raw in ["2A", "2"]:
-        if price >= (prior_resistance * 0.99) and rvol >= 1.5 and change > 2.0: setup = "Stage 2 Breakout"
-        elif change > 0 and curr_vol > max_down_vol and max_down_vol > 0 and position_20d > 0.3: setup = "Pocket Pivot"
-        elif range_20d_pct <= 0.25 and range_5d_abs <= (1.5 * atr_14) and position_20d > 0.5 and vdu: setup = "VCP Contraction"
+        if price >= (prior_resistance * 0.99) and rvol >= 1.5 and change > 2.0:
+            setup_flags.append("Stage 2 Breakout")
+        elif change > 0 and curr_vol > max_down_vol and max_down_vol > 0 and position_20d > 0.3:
+            setup_flags.append("Pocket Pivot")
+            
+        if range_20d_pct <= 0.25 and range_5d_abs <= (1.5 * atr_14) and position_20d > 0.5 and vdu:
+            setup_flags.append("VCP")
+            
+        if darvas_bo:
+            setup_flags.append("Darvas Breakout")
+        if darvas_coil:
+            setup_flags.append("Darvas Coil")
+
+    setup = " + ".join(setup_flags) if len(setup_flags) > 0 else "No Setup"
 
     mrs_series = []
     pure_rs_series = []
@@ -303,7 +340,6 @@ def calculate_metrics(sym, df, bench_series, itype):
             mrs_curve = ((ratio / ratio_ma) - 1.0) * 10.0
             mrs_series = mrs_curve.reindex(close.index).ffill().iloc[-90:].tolist()
             
-            # Extract Pure RS Line for individual chart
             pure_rs_series = ratio.reindex(close.index).ffill().iloc[-252:].tolist()
             dates_252 = close.index[-252:].strftime('%Y-%m-%d').tolist()
             price_252 = close.iloc[-252:].tolist()
@@ -373,87 +409,69 @@ def main():
     power_trend_on = float(b_df["Close"].ewm(span=21).mean().iloc[-1]) > float(b_df["Close"].rolling(50).mean().iloc[-1])
     bench_spark_vals = b_df["Close"].iloc[-125:].tolist()
 
-    processed_list = []
-    missing_data = []
-    
-    for sym, meta in active_universe.items():
-        df_sym = raw_data[sym].ffill().dropna(subset=["Close"]) if sym in raw_data else None
-        if df_sym is not None and len(df_sym) >= 130:
-            m = calculate_metrics(sym, df_sym, b_df["Close"], meta["type"])
-            if m:
-                clean_ticker = sym.replace(".AX", "")
-                m.update({"ticker": clean_ticker, "name": meta["name"], "type": meta["type"], "theme": meta["theme"]})
-                processed_list.append(m)
-        else:
-            missing_data.append(sym)
-
-    if not processed_list: st.warning("No instruments passed data validation."); return
-    if missing_data and universe_mode == "Core & Watchlist (Fast)": 
-        st.toast(f"Excluded due to missing/insufficient data: {', '.join(missing_data)}")
-
-    # Calculate Historical RS (1 Month Ago)
-    processed_list.sort(key=lambda x: x["raw_rs_1m"])
-    for idx, item in enumerate(processed_list):
-        item["rs_1m"] = max(1, min(99, round(((idx + 1) / len(processed_list)) * 99)))
-
-    # Calculate Current RS & Shift
-    processed_list.sort(key=lambda x: x["raw_rs"])
-    for idx, item in enumerate(processed_list):
-        item["rs"] = max(1, min(99, round(((idx + 1) / len(processed_list)) * 99)))
-        item["rs_shift"] = item["rs"] - item["rs_1m"]
-        mrs_v = round((item["rs"] - 50) / 15.0, 1)
-        
-        traj = "Flat"
-        if len(item["mrs_series"]) >= 5:
-            recent_mrs = [v for v in item["mrs_series"][-5:] if not np.isnan(v)]
-            if len(recent_mrs) >= 2:
-                slope = recent_mrs[-1] - recent_mrs[0]
-                if item["rs"] >= 95 and slope > 0.2: traj = "Extended"
-                elif slope > 0.2: traj = "Rising"
-                elif slope < -0.2: traj = "Falling"
-                else: traj = "Neutral"
-                
-        sign = "+" if mrs_v >= 0 else ""
-        item["mrs"] = f"{sign}{mrs_v} ({traj})"
-
-    df_all = pd.DataFrame(processed_list)
-    h_50, h_200, h_2a, h_3, h_uni, h_ad = get_historical_breadth(raw_data, active_universe.keys(), b_df.index)
-
-    total_u = len(df_all)
-    pct_50 = (df_all["above_50"].sum() / total_u * 100.0) if total_u > 0 else 0.0
-    pct_200 = (df_all["above_200"].sum() / total_u * 100.0) if total_u > 0 else 0.0
-    stage_2a_count = sum(df_all["stage_raw"] == "2A")
-    stage_3_count = sum(df_all["stage_raw"] == "3")
-
-    # TOP KPI CARDS
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    with k1: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>{bench_info["short"]} REGIME</span><span style="color:#94a3b8;">{bench_price:,.0f} ({bench_change:+.2f}%)</span></div><div class="kpi-val" style="color:{"#22c55e" if power_trend_on else "#f59e0b"};">{"● Power Trend ON" if power_trend_on else "○ Correction"}</div>{make_sparkline_svg(bench_spark_vals, stroke_color="#22c55e" if power_trend_on else "#f59e0b", fill_color="rgba(34,197,94,0.15)" if power_trend_on else "rgba(245,158,11,0.15)")}</div>', unsafe_allow_html=True)
-    with k2: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>% &gt; 50-DAY MA</span></div><div class="kpi-val" style="color:#f8fafc;">{pct_50:.1f}%</div>{make_sparkline_svg(h_50, stroke_color="#38bdf8", fill_color="rgba(56,189,248,0.15)")}</div>', unsafe_allow_html=True)
-    with k3: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>% &gt; 200-DAY MA</span></div><div class="kpi-val" style="color:#f8fafc;">{pct_200:.1f}%</div>{make_sparkline_svg(h_200, stroke_color="#818cf8", fill_color="rgba(129,140,248,0.15)")}</div>', unsafe_allow_html=True)
-    with k4: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>STAGE 2A LEADERS</span></div><div class="kpi-val" style="color:#22c55e;">{stage_2a_count} Breaking Out</div>{make_sparkline_svg(h_2a, stroke_color="#22c55e", fill_color="rgba(34,197,94,0.15)")}</div>', unsafe_allow_html=True)
-    with k5: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>STAGE 3 DISTRIBUTION</span></div><div class="kpi-val" style="color:#f43f5e;">{stage_3_count} Topping</div>{make_sparkline_svg(h_3, stroke_color="#f43f5e", fill_color="rgba(244,63,94,0.15)")}</div>', unsafe_allow_html=True)
-    with k6: st.markdown(f'<div class="kpi-card"><div class="kpi-title"><span>UNIVERSE</span></div><div class="kpi-val" style="color:#c084fc;">{total_u} Scanned</div>{make_sparkline_svg(h_uni, stroke_color="#c084fc", fill_color="rgba(192,132,252,0.15)")}</div>', unsafe_allow_html=True)
-
-    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
-
-    # MAIN APPLICATION TABS
     tab1, tab2 = st.tabs(["📊 Screener & Setup Charts", "🌍 Macro Breadth & Theme Rotation"])
 
     with tab1:
         with st.container(border=True):
-            f1, f2, f3, f4, f5, f6, f7 = st.columns([2.0, 1.2, 1.5, 1.5, 1.5, 1.5, 0.8])
+            f1, f2, f3, f4, f5, f6, f7, f8, f9 = st.columns([1.5, 1.0, 1.2, 1.2, 1.2, 1.2, 1.2, 1.5, 0.8])
             search_query = f1.text_input("Search", "", placeholder="Search Ticker..", label_visibility="collapsed").strip().lower()
             price_filter = f2.selectbox("Price", ["All Prices", "> $0.10", "> $0.50", "> $1.00", "> $5.00", "> $10.00"], label_visibility="collapsed")
             substage_filter = f3.selectbox("Stage", ["All Stages", "Stage 2A", "Stage 1B", "Stage 3", "Stage 4"], label_visibility="collapsed")
-            min_rs = f4.slider("Min RS", 0, 95, 0, 5, label_visibility="collapsed")
-            theme_filter = f5.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in active_universe.values()))), label_visibility="collapsed")
-            setup_filter = f6.selectbox("Setup", ["All Setups", "VCP Contraction", "Stage 2 Breakout", "Pocket Pivot", "No Setup"], label_visibility="collapsed")
-            if f7.button("Reset All", use_container_width=True):
+            min_rs = f4.slider("Min RS", 0, 95, 0, 5, label_visibility="collapsed", help="Minimum Relative Strength Rank")
+            
+            # Darvas Interactive Parameters
+            darvas_lb = f5.slider("Darvas Lookback", 5, 50, 21, 1, label_visibility="collapsed", help="Darvas Box Seed Lookback Days")
+            darvas_vol = f6.slider("Darvas Vol Thresh", 0.5, 3.0, 1.3, 0.1, label_visibility="collapsed", help="Darvas Breakout Volume Multiplier")
+            
+            theme_filter = f7.selectbox("Theme", ["All Themes"] + sorted(list(set(v["theme"] for v in active_universe.values()))), label_visibility="collapsed")
+            setup_filter = f8.selectbox("Setup", ["All Setups", "VCP", "Stage 2 Breakout", "Pocket Pivot", "Darvas Breakout", "Darvas Coil", "No Setup"], label_visibility="collapsed")
+            if f9.button("Reset", use_container_width=True):
                 st.session_state.show_starred_only = False
                 st.cache_data.clear()
                 st.rerun()
 
+        # Engine Processing loop inside Tab 1 so it triggers AFTER slider variables are set
+        processed_list = []
+        missing_data = []
+        for sym, meta in active_universe.items():
+            df_sym = raw_data[sym].ffill().dropna(subset=["Close"]) if sym in raw_data else None
+            if df_sym is not None and len(df_sym) >= 130:
+                m = calculate_metrics(sym, df_sym, b_df["Close"], meta["type"], darvas_lb, darvas_vol)
+                if m:
+                    clean_ticker = sym.replace(".AX", "")
+                    m.update({"ticker": clean_ticker, "name": meta["name"], "type": meta["type"], "theme": meta["theme"]})
+                    processed_list.append(m)
+            else:
+                missing_data.append(sym)
+
+        if not processed_list: st.warning("No instruments passed data validation."); return
+        if missing_data and universe_mode == "Core & Watchlist (Fast)": 
+            st.toast(f"Excluded due to missing/insufficient data: {', '.join(missing_data)}")
+
+        processed_list.sort(key=lambda x: x["raw_rs_1m"])
+        for idx, item in enumerate(processed_list): item["rs_1m"] = max(1, min(99, round(((idx + 1) / len(processed_list)) * 99)))
+
+        processed_list.sort(key=lambda x: x["raw_rs"])
+        for idx, item in enumerate(processed_list):
+            item["rs"] = max(1, min(99, round(((idx + 1) / len(processed_list)) * 99)))
+            item["rs_shift"] = item["rs"] - item["rs_1m"]
+            mrs_v = round((item["rs"] - 50) / 15.0, 1)
+            
+            traj = "Flat"
+            if len(item["mrs_series"]) >= 5:
+                recent_mrs = [v for v in item["mrs_series"][-5:] if not np.isnan(v)]
+                if len(recent_mrs) >= 2:
+                    slope = recent_mrs[-1] - recent_mrs[0]
+                    if item["rs"] >= 95 and slope > 0.2: traj = "Extended"
+                    elif slope > 0.2: traj = "Rising"
+                    elif slope < -0.2: traj = "Falling"
+                    else: traj = "Neutral"
+                    
+            item["mrs"] = f"{'+' if mrs_v >= 0 else ''}{mrs_v} ({traj})"
+
+        df_all = pd.DataFrame(processed_list)
         df = df_all.copy()
+        
         if price_filter != "All Prices":
             min_price = float(price_filter.replace("> $", ""))
             df = df[df["price"] > min_price]
@@ -461,7 +479,10 @@ def main():
         if search_query: df = df[df["ticker"].str.lower().str.contains(search_query)]
         if theme_filter != "All Themes": df = df[df["theme"] == theme_filter]
         if substage_filter != "All Stages": df = df[df["stage_raw"] == substage_filter.split(" ")[1]]
-        if setup_filter != "All Setups": df = df[df["setup"] == setup_filter]
+        
+        # Confluence Text Matcher
+        if setup_filter != "All Setups": df = df[df["setup"].str.contains(setup_filter)]
+        
         df = df[df["rs"] >= min_rs]
 
         df_display = df[["ticker", "name", "price", "change", "ret_1m", "ret_3m", "pivot_dist", "adr", "rs", "rs_shift", "mrs", "trend_score", "stage", "setup", "adtv_fmt"]].copy()
@@ -555,7 +576,6 @@ def main():
                 """
                 components.html(tv_html, height=550)
 
-                # Pure RS Line Chart
                 if len(selected_row["dates_252"]) > 0:
                     fig_rs = make_subplots(specs=[[{"secondary_y": True}]])
                     fig_rs.add_trace(go.Scatter(x=selected_row["dates_252"], y=selected_row["price_252"], name="Price", line=dict(color="#f8fafc", width=1.5)), secondary_y=False)
@@ -574,6 +594,8 @@ def main():
         st.markdown("### Institutional Macro & Theme Leadership")
         c1, c2 = st.columns([6, 4])
         
+        h_50, h_200, h_2a, h_3, h_uni, h_ad = get_historical_breadth(raw_data, active_universe.keys(), b_df.index)
+
         with c1:
             st.markdown("<div style='font-size:0.85rem; font-weight:700; color:#94a3b8; margin-bottom:10px;'>CUMULATIVE ADVANCE / DECLINE LINE</div>", unsafe_allow_html=True)
             fig_ad = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.5, 0.5])
